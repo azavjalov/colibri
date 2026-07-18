@@ -90,7 +90,7 @@ ifneq (,$(PPC64))
 CC      = gcc
 ARCH   ?= native
 CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+LDFLAGS = -lm -fopenmp -pthread -lnuma
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
@@ -102,6 +102,12 @@ CC      = gcc
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
+# NUMA_PARTITION data placement (mbind) is guarded `#ifdef __linux__` in glm.c -- *BSD has no
+# libnuma package, so only add -lnuma when actually targeting Linux (not the *BSD half of
+# this shared branch), or a *BSD build fails at link with "cannot find -lnuma".
+ifneq (,$(LINUX))
+LDFLAGS += -lnuma
+endif
 EXE     =
 endif
 endif

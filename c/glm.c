@@ -37,6 +37,10 @@
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
+#ifdef __linux__
+#include <numa.h>                                 /* NUMA_PARTITION: numa_max_node() for topology sizing */
+#include <numaif.h>                                /* mbind: page-level NUMA placement (MPOL_BIND+MPOL_MF_MOVE) */
+#endif
 #if defined(_WIN32) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
@@ -86,6 +90,45 @@ static inline float hsum256(__m256 v){            /* somma orizzontale di 8 floa
 #include <mach/mach.h>                            /* host_statistics64: MemAvailable di macOS */
 #endif
 
+/* ---- AMX int8 tile GEMM enablement (x86 Phase 1) ----
+ * __AMX_INT8__ is only defined by the compiler under -march=native (or an
+ * explicit -mamx-tile -mamx-int8) on a host whose ISA advertises AMX, e.g.
+ * Sapphire/Granite Rapids — never under the portable ARCH=x86-64-v3 baseline,
+ * which is how the portable build compiles this whole feature out for free.
+ * AMX tile hardware + the arch_prctl enable call are Linux-only (no macOS/
+ * Windows AMX tile-state API), hence the added __linux__ guard everywhere
+ * below — this is stricter than the bare __AMX_INT8__ check the task asked
+ * for, but avoids ever compiling amx_enable()'s syscall on a platform that
+ * doesn't have it. HARD CONSTRAINT: plain AMX int8 tile ops only
+ * (_tile_dpbssd/_tile_loadd/_tile_stored/_tile_zero/_tile_loadconfig/
+ * _tile_release) — no AMX-COMPLEX (_tile_cmmimfp16ps etc). */
+#if defined(__AMX_INT8__) && defined(__linux__)
+#include <sys/syscall.h>                          /* SYS_arch_prctl */
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#ifndef XFEATURE_XTILEDATA
+#define XFEATURE_XTILEDATA 18
+#endif
+/* Request AMX tile-state permission for this process. Must run once, on the
+ * MAIN thread, before any _tile_* intrinsic executes anywhere (tile CONFIG
+ * itself is per-thread and is loaded separately via _tile_loadconfig inside
+ * each OMP parallel region — see matmul_q_idot_mm_amx further below). Ported
+ * verbatim from amxbench.c, the standalone micro-benchmark already validated
+ * token-exact against a scalar reference. Failure here must never abort the
+ * process — the caller (main) just leaves AMX disabled and runs on VNNI. */
+static int amx_enable(void){
+    if(syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)!=0){
+        perror("arch_prctl XTILEDATA"); return -1;
+    }
+    return 0;
+}
+typedef struct __attribute__((packed)) {
+    uint8_t palette; uint8_t start_row; uint8_t reserved[14];
+    uint16_t colsb[16]; uint8_t rows[16];
+} tilecfg_t;
+#endif /* __AMX_INT8__ && __linux__ */
+
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
@@ -104,10 +147,25 @@ typedef struct {
 /* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
+    uint8_t *e8;  /* fmt=5 MXFP4: E8M0 power-of-2 group-scale bytes [O,I/32], scale=2^(b-127); gs=32; s unused */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
+    /* AMX Phase 1 (x86, int8 tile GEMM): amx_q8 is a lazily-allocated, fully
+     * pre-packed (AMX VNNI-B layout) copy of this tensor's weights, built by
+     * amx_prepack_q8/amx_prepack_i4 the first time a batch is large enough to
+     * use it. amx_packed: 0=not attempted yet, 1=packed & ready, -1=ineligible
+     * shape (O%16!=0 or I%64!=0) — a sentinel so we never retry every call.
+     * amx_eligible mirrors cuda_eligible's documented intent ("resident
+     * tensor, never a reused expert slot") but is set unconditionally (see
+     * qt_load): cuda_eligible itself is only ever set to 1 inside #ifdef
+     * COLI_CUDA, so on a CPU-only (CUDA=0) build it is permanently 0 and
+     * cannot be reused as the AMX gate without silently disabling AMX
+     * everywhere. Streaming/reused ESlot expert tensors (loaded via
+     * qt_from_disk directly, not qt_load) never get amx_eligible set and so
+     * are correctly excluded from Phase 1 pre-packing. */
+    int8_t *amx_q8; int amx_packed, amx_eligible;
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -117,6 +175,8 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     if(t->fmt==4){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
         int ng=(t->I+t->gs-1)/t->gs;
         return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*ng*4; }
+    if(t->fmt==5){ /* MXFP4: E2M1 nibbles (I/2 B) + E8M0 group bytes (I/32 B), gs=32 */
+        return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*((t->I+31)/32); }
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
@@ -174,6 +234,13 @@ typedef struct {
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
+    /* MVP-1 RESIDENT: experts[layer] e' un array calloc'd di c->n_experts ESlot,
+     * indicizzato DIRETTAMENTE per eid, wired UNA VOLTA in model_init() via la stessa
+     * expert_load() del path streaming (g_mmap=1 -> viste zero-copy nella page cache,
+     * niente slab/malloc per expert). moe() lo indexa e basta: niente pin/ecache/miss/disk.
+     * resident=1 di default (env RESIDENT); RESIDENT=0 ripristina lo streaming originale
+     * intatto (A/B, stesso binario). NULL/0 quando resident==0. */
+    ESlot **experts; int resident;
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
     uint32_t **eheat;                            /* calore recente per promotion/demotion live */
     uint32_t **elast, eaccess_clock;              /* recency per LFRU session-local */
@@ -197,6 +264,11 @@ typedef struct {
     double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
     double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
     double t_aproj,t_acore,t_aout;                     /* attention breakdown */
+    /* MVP-2-prep instrumentation (INSTR=1): split MoE decode time into kernel vs orchestration
+     * (gather/scatter/fork-join), and count OMP parallel-region launches, to test whether the
+     * 40->120-thread plateau is fork/join-overhead-bound (not BW-bound). */
+    double t_moe_kernel, t_moe_orch, t_moe_conv;
+    uint64_t moe_pcalls;
     int64_t resident_bytes;
     /* DISK_SPLIT=1: split dei DISK LOAD (miss LRU -> expert_load) per contesto e per tipo
      * di layer. ld_ctx: 0=main/verify/prefill, 1=dentro mtp_draft, 2=dentro mtp_absorb. */
@@ -397,6 +469,130 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
  * Same nibble math as matmul_i4, but the scale changes every `gs` elements along I.
  * The accumulator resets at each group boundary: dot(x[grp], w[grp]) * scale[grp].
  * gs MUST be a multiple of 16 (the AVX2 vector width). */
+/* ===================== MXFP4 expert kernel (fmt=5) =====================
+ * Ported from kt-kernel GemmKernel224MXFP4SmallKGroup (operators/amx/fp4-moe.hpp):
+ * E2M1 4-bit weights + E8M0 power-of-2 per-32-group scales, dot via AVX512-BF16
+ * (_mm512_dpbf16_ps). Activations converted f32->bf16 on the fly. gs=32 fixed.
+ * y[S,O] = x[S,I] @ W^T. Wins vs the int4 kernel at S>=8 (1.5-3.8x); at S=1 the int4
+ * kernel is faster (measured) so matmul_qt_ex dispatches fmt=5 to here only for S>=g_mxfp4_smin.
+ * Bit-exact-to-tolerance vs a scalar MXFP4 reference (validated in mxfp4bench.c). */
+#if defined(__AVX512BF16__)
+alignas(16) static const uint8_t _mxfp4_lo[16]={0x00,0x00,0x80,0xC0,0x00,0x40,0x80,0xC0,0x00,0x00,0x80,0xC0,0x00,0x40,0x80,0xC0};
+alignas(16) static const uint8_t _mxfp4_hi[16]={0x00,0x3F,0x3F,0x3F,0x40,0x40,0x40,0x40,0x80,0xBF,0xBF,0xBF,0xC0,0xC0,0xC0,0xC0};
+static inline __m512i _mxfp4_to_bf16_32(__m128i packed){
+    __m128i m=_mm_set1_epi8(0x0F);
+    __m128i lo=_mm_and_si128(packed,m), hi=_mm_and_si128(_mm_srli_epi16(packed,4),m);
+    __m128i Ll=_mm_load_si128((__m128i*)_mxfp4_lo), Lh=_mm_load_si128((__m128i*)_mxfp4_hi);
+    __m128i l_lo=_mm_shuffle_epi8(Ll,lo), l_hi=_mm_shuffle_epi8(Lh,lo);
+    __m128i b0=_mm_unpacklo_epi8(l_lo,l_hi), b1=_mm_unpackhi_epi8(l_lo,l_hi);
+    __m128i h_lo=_mm_shuffle_epi8(Ll,hi), h_hi=_mm_shuffle_epi8(Lh,hi);
+    __m128i c0=_mm_unpacklo_epi8(h_lo,h_hi), c1=_mm_unpackhi_epi8(h_lo,h_hi);
+    __m128i p0=_mm_unpacklo_epi16(b0,c0), p1=_mm_unpackhi_epi16(b0,c0);
+    __m128i p2=_mm_unpacklo_epi16(b1,c1), p3=_mm_unpackhi_epi16(b1,c1);
+    __m256i q0=_mm256_inserti128_si256(_mm256_castsi128_si256(p0),p1,1);
+    __m256i q1=_mm256_inserti128_si256(_mm256_castsi128_si256(p2),p3,1);
+    return _mm512_inserti64x4(_mm512_castsi256_si512(q0),q1,1);
+}
+/* convert 32 f32 activations at xs -> one __m512bh (bf16). round-to-nearest-even via +0x7fff+lsb. */
+static inline __m512bh _f32x32_to_bf16(const float *xs){
+    /* 32 f32 -> 32 bf16 in LINEAR order [x0..x31] to match _mxfp4_to_bf16_32's column order.
+     * _mm512_cvtneps_pbh: 16 f32 -> 16 bf16 in the low 256 bits (linear). Concatenate two. */
+    __m256i lo=(__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(xs));
+    __m256i hi=(__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(xs+16));
+    return (__m512bh)_mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+}
+static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const float *sf,
+                         int S, int I, int O){
+    const int kg=I/32, rb=I/2, ng=I/32;
+    #pragma omp parallel
+    {
+      #pragma omp for schedule(static)
+      for(int o4=0;o4<O;o4+=4){
+        int nb=(o4+4<=O)?4:(O-o4);
+        const float *scl[4]; const uint8_t *w[4];
+        for(int j=0;j<nb;j++){ scl[j]=sf+(int64_t)(o4+j)*ng; w[j]=q4+(int64_t)(o4+j)*rb; }
+        int st=0;
+        if(nb==4){
+          for(; st+4<=S; st+=4){
+            __m512 acc[4][4]; for(int i=0;i<4;i++)for(int j=0;j<4;j++) acc[i][j]=_mm512_setzero_ps();
+            const float *ax[4]={x+(int64_t)(st+0)*I,x+(int64_t)(st+1)*I,x+(int64_t)(st+2)*I,x+(int64_t)(st+3)*I};
+            for(int g=0;g<kg;g++){
+              __m512bh d0=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[0]+g*16)));
+              __m512bh d1=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[1]+g*16)));
+              __m512bh d2=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[2]+g*16)));
+              __m512bh d3=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[3]+g*16)));
+              for(int i=0;i<4;i++){ __m512bh av=_f32x32_to_bf16(ax[i]+g*32);
+                acc[i][0]=_mm512_fmadd_ps(_mm512_set1_ps(scl[0][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d0),acc[i][0]);
+                acc[i][1]=_mm512_fmadd_ps(_mm512_set1_ps(scl[1][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d1),acc[i][1]);
+                acc[i][2]=_mm512_fmadd_ps(_mm512_set1_ps(scl[2][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d2),acc[i][2]);
+                acc[i][3]=_mm512_fmadd_ps(_mm512_set1_ps(scl[3][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d3),acc[i][3]); }
+            }
+            for(int i=0;i<4;i++){ float*yr=y+(int64_t)(st+i)*O+o4;
+              yr[0]=_mm512_reduce_add_ps(acc[i][0]); yr[1]=_mm512_reduce_add_ps(acc[i][1]);
+              yr[2]=_mm512_reduce_add_ps(acc[i][2]); yr[3]=_mm512_reduce_add_ps(acc[i][3]); }
+          }
+        }
+        for(; st<S; st++){ const float *ar=x+(int64_t)st*I; float*yr=y+(int64_t)st*O;
+          for(int j=0;j<nb;j++){ const uint8_t*ww=w[j]; __m512 acc=_mm512_setzero_ps();
+            for(int g=0;g<kg;g++){ __m512bh av=_f32x32_to_bf16(ar+g*32);
+              acc=_mm512_fmadd_ps(_mm512_set1_ps(scl[j][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(ww+g*16)))),acc); }
+            yr[o4+j]=_mm512_reduce_add_ps(acc); }
+        }
+      }
+    }
+}
+
+/* Batch-union helpers (the "golden" kt-kernel structure): convert the gathered activation
+ * rows to BF16 ONCE, then run gate+up (fused, reading the bf16 once) and down over the
+ * pre-converted buffer — instead of re-converting f32->bf16 inside every per-expert/per-proj
+ * kernel call. abf16 = [S rows][I] bf16 (already converted by the caller). */
+static void matmul_mxfp4_bf16(float *y, const uint16_t *abf16, const uint8_t *q4, const float *sf,
+                              int S, int I, int O){
+    const int kg=I/32, rb=I/2, ng=I/32;
+    #pragma omp parallel
+    {
+      #pragma omp for schedule(static)
+      for(int o4=0;o4<O;o4+=4){ int nb=(o4+4<=O)?4:(O-o4);
+        const float *scl[4]; const uint8_t *w[4];
+        for(int jj=0;jj<nb;jj++){ scl[jj]=sf+(int64_t)(o4+jj)*ng; w[jj]=q4+(int64_t)(o4+jj)*rb; }
+        int st=0;
+        if(nb==4){ for(; st+4<=S; st+=4){
+            __m512 acc[4][4]; for(int a=0;a<4;a++)for(int b=0;b<4;b++) acc[a][b]=_mm512_setzero_ps();
+            const uint16_t *ar[4]={abf16+(int64_t)(st+0)*I,abf16+(int64_t)(st+1)*I,abf16+(int64_t)(st+2)*I,abf16+(int64_t)(st+3)*I};
+            for(int g=0;g<kg;g++){
+              __m512bh d0=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[0]+g*16)));
+              __m512bh d1=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[1]+g*16)));
+              __m512bh d2=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[2]+g*16)));
+              __m512bh d3=(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(w[3]+g*16)));
+              for(int a=0;a<4;a++){ __m512bh av=(__m512bh)_mm512_loadu_si512((const void*)(ar[a]+g*32));
+                acc[a][0]=_mm512_fmadd_ps(_mm512_set1_ps(scl[0][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d0),acc[a][0]);
+                acc[a][1]=_mm512_fmadd_ps(_mm512_set1_ps(scl[1][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d1),acc[a][1]);
+                acc[a][2]=_mm512_fmadd_ps(_mm512_set1_ps(scl[2][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d2),acc[a][2]);
+                acc[a][3]=_mm512_fmadd_ps(_mm512_set1_ps(scl[3][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d3),acc[a][3]); }
+            }
+            for(int a=0;a<4;a++){ float*yr=y+(int64_t)(st+a)*O+o4;
+              yr[0]=_mm512_reduce_add_ps(acc[a][0]); yr[1]=_mm512_reduce_add_ps(acc[a][1]);
+              yr[2]=_mm512_reduce_add_ps(acc[a][2]); yr[3]=_mm512_reduce_add_ps(acc[a][3]); } } }
+        for(; st<S; st++){ const uint16_t *ar=abf16+(int64_t)st*I; float*yr=y+(int64_t)st*O;
+          for(int jj=0;jj<nb;jj++){ const uint8_t*ww=w[jj]; __m512 acc=_mm512_setzero_ps();
+            for(int g=0;g<kg;g++){ __m512bh av=(__m512bh)_mm512_loadu_si512((const void*)(ar+g*32));
+              acc=_mm512_fmadd_ps(_mm512_set1_ps(scl[jj][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(ww+g*16)))),acc); }
+            yr[o4+jj]=_mm512_reduce_add_ps(acc); } }
+      } }
+}
+/* convert S*I f32 -> S*I bf16 (linear order) into dst; parallel over rows. */
+static void f32_to_bf16_buf(uint16_t *dst, const float *src, int64_t n){
+    #pragma omp parallel for schedule(static)
+    for(int64_t i=0;i<n;i+=32){
+        int64_t r=n-i; if(r>=32){
+            __m256i lo=(__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src+i));
+            __m256i hi=(__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src+i+16));
+            _mm256_storeu_si256((__m256i*)(dst+i),lo); _mm256_storeu_si256((__m256i*)(dst+i+16),hi);
+        } else { for(int64_t k=i;k<n;k++){ uint32_t u; memcpy(&u,src+k,4); dst[k]=(uint16_t)((u+0x8000)>>16); } }
+    }
+}
+#endif /* __AVX512BF16__ */
+
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
@@ -578,6 +774,17 @@ static int g_i4s=1;   /* POWER8 vec_msum: qui il fallback f32 e' SCALARE, quindi
 static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 dell'autore).
                        * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
 #endif
+/* x86 AMX int8 tile GEMM (Phase 1: resident/dense weights, S>=g_amx_smin).
+ * Runtime-enabled in main() via amx_enable(); env AMX=0/1 overrides the
+ * default, AMX_SMIN overrides the S threshold (default 16 = one AMX M-tile).
+ * Declared unconditionally (plain ints) so the portable ARCH=x86-64-v3 build
+ * still compiles: every USE of g_amx is guarded by #if defined(__AMX_INT8__)
+ * && defined(__linux__), so on that build it just stays 0 and is read by
+ * nothing. S=1 decode never benefits (validated: AMX loses to VNNI at S=1;
+ * wins ~6-8x at S=32-128 with B pre-packed) — the S>=g_amx_smin gate below
+ * keeps it off VNNI's turf. */
+static int g_amx=0;
+static int g_amx_smin=16;
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
@@ -950,6 +1157,262 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
 
+#if defined(__AMX_INT8__) && defined(__linux__)
+/* ---- AMX int8 tile GEMM kernel (Phase 1: resident/dense weights only) ----
+ * Ported verbatim from the validated amxbench.c micro-benchmark (checked
+ * token-exact, match=ok, against a scalar int32 reference at S=1/8/32/128).
+ * Only PLAIN AMX int8 tile ops: _tile_dpbssd/_tile_loadd/_tile_stored/
+ * _tile_zero/_tile_loadconfig/_tile_release. No AMX-COMPLEX.
+ *
+ * qalloc() is defined further below, near the other qt_* allocators; forward
+ * declare it here so amx_prepack_q8/amx_prepack_i4 can use it without moving
+ * either definition out of its natural place in the file. */
+static void *qalloc(size_t n);
+
+#define AMX_TILE_M 16   /* A/C tile rows == S rows handled per AMX tile */
+
+/* pack a [rows x K] int8 block (row-major, rows<=16, K mult of 4) into AMX
+ * VNNI-B layout [K/4][rows][4] flattened: dst[(kg*rows+r)*4+b]=src[r][kg*4+b]. */
+static void pack_amx(int8_t *dst, const int8_t *src, int rows, int K, int64_t src_stride){
+    for(int r=0;r<rows;r++){
+        const int8_t *sr=src+(int64_t)r*src_stride;
+        for(int kg=0; kg<K/4; kg++){
+            int8_t *d=dst + ((int64_t)kg*rows + r)*4;
+            d[0]=sr[kg*4+0]; d[1]=sr[kg*4+1]; d[2]=sr[kg*4+2]; d[3]=sr[kg*4+3];
+        }
+    }
+}
+/* pack a full [rows x I] int8 block (rows<=16) into AMX layout across the
+ * whole K dimension: chunks [I/KT][KT/4][rows][4], KT=64. */
+static void pack_amx_full(int8_t *dst, const int8_t *src, int rows, int I){
+    const int KT=64;
+    for(int ko=0; ko<I/KT; ko++)
+        pack_amx(dst + (int64_t)ko*(KT/4)*rows*4, src + ko*KT, rows, KT, I);
+}
+
+/* Lazily pre-pack a resident int8 [O,I] weight into AMX B layout, once.
+ * Gated on amx_eligible (set only by qt_load — never a streaming/reused
+ * ESlot expert tensor). amx_packed sentinel: 0=untried, 1=packed ok,
+ * -1=ineligible shape (ragged O%16!=0 or I%64!=0) so we don't retry on every
+ * call. Correctness over coverage: a ragged resident tensor (colibri's dense
+ * weights are typically multiples of 128/256, but this must not be assumed)
+ * simply stays on the VNNI path forever — no partial-tile code. Not locked:
+ * a concurrent first-use race just repacks redundantly into two buffers (the
+ * later store wins, the other transiently leaks) — never wrong data, since
+ * both packs read the same immutable w->q8. See report for the eager-pack-
+ * after-model_init alternative that would remove even that. */
+static void amx_prepack_q8(QT *w){
+    if(w->amx_packed || !w->amx_eligible || w->fmt!=1 || !w->q8) return;
+    int O=w->O, I=w->I;
+    if(O<=0 || I<=0 || O%16!=0 || I%64!=0){ w->amx_packed=-1; return; }
+    int8_t *packed=(int8_t*)qalloc((size_t)O*I);
+    if(!packed){ w->amx_packed=-1; return; }
+    const int NT=16;
+    for(int no=0; no<O/NT; no++)
+        pack_amx_full(packed + (int64_t)no*I*NT, w->q8 + (int64_t)no*NT*I, NT, I);
+    w->amx_q8=packed; w->amx_packed=1;
+}
+/* Same idea for a resident int4 [O,I] weight: unpack nibbles into a transient
+ * full-int8 scratch buffer — identical value convention to dot_i4i8: low
+ * nibble (b&0xF)-8 for even i, high nibble (b>>4)-8 for odd i, so the AMX
+ * int32 dot is the exact same sum as the VNNI int4 kernel, just reassociated
+ * (integer add is exact/associative in two's complement: reassociating it
+ * changes nothing, unlike float). Then pack it exactly like the int8 path.
+ * The permanent amx_q8 ends up O*I bytes — 2x the O*I/2 int4 storage — but
+ * only for the handful of resident dense tensors that are int4. */
+static void amx_prepack_i4(QT *w){
+    if(w->amx_packed || !w->amx_eligible || w->fmt!=2 || !w->q4) return;
+    int O=w->O, I=w->I;
+    if(O<=0 || I<=0 || O%16!=0 || I%64!=0){ w->amx_packed=-1; return; }
+    int rb=(I+1)/2;
+    int8_t *unpacked=(int8_t*)malloc((size_t)O*I);   /* transient scratch, not a resident tensor */
+    if(!unpacked){ w->amx_packed=-1; return; }
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *row4=w->q4+(int64_t)o*rb;
+        int8_t *rowfull=unpacked+(int64_t)o*I;
+        int i=0;
+        for(;i+1<I;i+=2){ uint8_t b=row4[i>>1];
+            rowfull[i]=(int8_t)((int)(b&0xF)-8); rowfull[i+1]=(int8_t)((int)(b>>4)-8); }
+        if(i<I){ uint8_t b=row4[i>>1]; rowfull[i]=(int8_t)((int)(b&0xF)-8); }
+    }
+    int8_t *packed=(int8_t*)qalloc((size_t)O*I);
+    if(!packed){ free(unpacked); w->amx_packed=-1; return; }
+    const int NT=16;
+    for(int no=0; no<O/NT; no++)
+        pack_amx_full(packed + (int64_t)no*I*NT, unpacked + (int64_t)no*NT*I, NT, I);
+    free(unpacked);
+    w->amx_q8=packed; w->amx_packed=1;
+}
+
+/* AMX GEMM+scale, 2x2 tile-register-blocked (Phase 2 — replaces the old
+ * single-C-tile kernel): y[s*O+o] = (float)dot(xq[s],Bp[o]) * scale[o] *
+ * sx[s]. Ported verbatim (control flow + indexing) from the standalone
+ * amxbench.c's gemm_amx_2x2, already validated bit-exact there against a
+ * scalar int32 reference (+23-45% over the single-tile kernel this replaces:
+ * 57 TFLOP/s int8 @ S=128, 43 threads). The only change from amxbench.c is
+ * the store: gemm_amx_2x2 writes raw int32 into an "acc" buffer, this writes
+ * (float)dot*scale[o]*sx[s] straight into y — in the exact same left-to-
+ * right multiply order the old single-tile kernel used (yr[n]=(float)tr[n]*
+ * sc[n]*sxm) so the scale-application rounding stays bit-identical; the
+ * int32 dot itself is bit-identical too since both kernels accumulate the
+ * same ko=0..nKt-1 K-chunks via the same _tile_dpbssd op (int32 add is exact
+ * and associative, so 2x2's register-blocking — which only changes *which*
+ * tile registers hold live accumulators, not the per-(s,o) summation order —
+ * cannot change the result).
+ *
+ * DISPATCH CHOICE: kept matmul_qt_ex's dispatch UNCHANGED — it still passes
+ * only Sfull=(S/AMX_TILE_M)*AMX_TILE_M and still runs its own exact-VNNI
+ * tail for the S%16 remainder, exactly as it did for the single-tile kernel.
+ * So S here is always a multiple of 16 (same contract the single-tile
+ * kernel had), which makes nSt=(S+MT-1)/MT below exact (==S/MT) and means
+ * the "ragged S" branch only ever fires for the *odd 16-row-tile* case
+ * (S/16 odd, e.g. Sfull=16/48/80..., not a multiple of 32) — never a
+ * genuinely partial (<16-row) tile. This is the SAFER of the two dispatch
+ * options: zero changes to matmul_qt_ex or the VNNI/AMX split, only this
+ * kernel's internals differ. Kept the ceiling form and the mrows guards
+ * below anyway, verbatim from amxbench.c, since they're harmless no-ops
+ * under that guarantee and this is meant to be a faithful port, not a
+ * rewrite.
+ *
+ * All 8 AMX tile regs are used: tile0..3=C00,C01,C10,C11 (16x16 int32 each;
+ * macro-block rows 0-15/16-31 x cols 0-15/16-31); tile4,5=A0,A1 (16x64 int8;
+ * M rows 0-15/16-31 of the macro-block); tile6,7=B0,B1 (16x64 packed VNNI; N
+ * cols 0-15/16-31 of the macro-block). Bp is amx_prepack_q8/_i4's per-16-
+ * col-tile layout, so B0/B1 for macro-col-block nb are simply the two
+ * ADJACENT 16-col tiles Bp+(2*nb)*I*NT and +(2*nb+1)*I*NT — no repacking.
+ * Every K-step issues 4 INDEPENDENT _tile_dpbssd (no data dependency between
+ * them), hiding tileload->tdpbssd latency far better than 1-live-C-tile.
+ *
+ * Ragged O (O/16 odd) and ragged S (S/16 odd, see dispatch note above) fall
+ * back to a single-tile path reusing tile0(C)/tile4(A)/tile6(B) — same cfg
+ * shape as the old kernel's tile0/1/2, so one _tile_loadconfig covers both
+ * the 2x2 bulk path and the ragged fallback. */
+static void matmul_q_idot_mm_amx(float *y, const int8_t *xq, const float *sx,
+                                 const int8_t *Bp, const float *scale, int S, int I, int O){
+    if(S<=0) return;
+    const int MT=AMX_TILE_M, NT=16, KT=64;
+    tilecfg_t cfg; memset(&cfg,0,sizeof(cfg)); cfg.palette=1;
+    for(int t=0;t<4;t++){ cfg.rows[t]=MT; cfg.colsb[t]=NT*4; }  /* C00,C01,C10,C11 */
+    cfg.rows[4]=MT;    cfg.colsb[4]=KT;                          /* A0 */
+    cfg.rows[5]=MT;    cfg.colsb[5]=KT;                          /* A1 */
+    cfg.rows[6]=KT/4;  cfg.colsb[6]=NT*4;                        /* B0 */
+    cfg.rows[7]=KT/4;  cfg.colsb[7]=NT*4;                        /* B1 */
+
+    int nOt=O/NT, nKt=I/KT, nSt=(S+MT-1)/MT;
+    int nOb=nOt/2, nOt_rem=nOt%2;
+    int nSb=nSt/2, nSt_rem=nSt%2;
+
+    #pragma omp parallel
+    {
+        _tile_loadconfig(&cfg);
+
+        /* --- bulk: 32x32 macro-blocks, 4 live C tiles, 4 dpbssd per K-step.
+         * Guarded (nSb>0 && nOb>0) so a small-S/O call skips the work-
+         * sharing dispatch + implicit barrier entirely rather than paying
+         * for a zero-trip omp-for on every ragged-only call — verbatim
+         * rationale from amxbench.c. */
+        if(nSb>0 && nOb>0){
+        #pragma omp for schedule(static) collapse(2)
+        for(int sb=0; sb<nSb; sb++){
+            for(int nb=0; nb<nOb; nb++){
+                int s0=sb*2*MT;
+                const int8_t *A0row=xq+(int64_t)s0*I;
+                const int8_t *A1row=xq+(int64_t)(s0+MT)*I;
+                const int8_t *B0=Bp+(int64_t)(2*nb)*I*NT;
+                const int8_t *B1=Bp+(int64_t)(2*nb+1)*I*NT;
+                _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);
+                for(int ko=0; ko<nKt; ko++){
+                    int64_t boff=(int64_t)ko*(KT/4)*NT*4;
+                    _tile_loadd(4, A0row+ko*KT, I);
+                    _tile_loadd(5, A1row+ko*KT, I);
+                    _tile_loadd(6, B0+boff, NT*4);
+                    _tile_loadd(7, B1+boff, NT*4);
+                    _tile_dpbssd(0,4,6);   /* C00 += A0.B0 */
+                    _tile_dpbssd(1,4,7);   /* C01 += A0.B1 */
+                    _tile_dpbssd(2,5,6);   /* C10 += A1.B0 */
+                    _tile_dpbssd(3,5,7);   /* C11 += A1.B1 */
+                }
+                int32_t t00[16*16],t01[16*16],t10[16*16],t11[16*16];
+                _tile_stored(0,t00,NT*4); _tile_stored(1,t01,NT*4);
+                _tile_stored(2,t10,NT*4); _tile_stored(3,t11,NT*4);
+                int no0=2*nb*NT, no1=(2*nb+1)*NT;
+                const float *sc0=scale+no0, *sc1=scale+no1;
+                for(int m=0;m<MT;m++){
+                    int s_lo=s0+m, s_hi=s0+MT+m;
+                    float sx_lo=sx[s_lo], sx_hi=sx[s_hi];
+                    float *y00=y+(int64_t)s_lo*O+no0, *y01=y+(int64_t)s_lo*O+no1;
+                    float *y10=y+(int64_t)s_hi*O+no0, *y11=y+(int64_t)s_hi*O+no1;
+                    const int32_t *r00=t00+m*NT, *r01=t01+m*NT, *r10=t10+m*NT, *r11=t11+m*NT;
+                    for(int n=0;n<NT;n++){
+                        y00[n]=(float)r00[n]*sc0[n]*sx_lo;   /* same L-to-R order as VNNI */
+                        y01[n]=(float)r01[n]*sc1[n]*sx_lo;
+                        y10[n]=(float)r10[n]*sc0[n]*sx_hi;
+                        y11[n]=(float)r11[n]*sc1[n]*sx_hi;
+                    }
+                }
+            }
+        }
+        }
+
+        /* --- ragged O edge (O/16 odd): leftover 16-col tile x ALL S 16-row tiles --- */
+        if(nOt_rem){
+            int no=2*nOb;
+            const int8_t *Bt=Bp+(int64_t)no*I*NT;
+            const float *sc=scale+(int64_t)no*NT;
+            #pragma omp for schedule(static)
+            for(int so=0; so<nSt; so++){
+                int s0=so*MT;
+                const int8_t *Arow=xq+(int64_t)s0*I;
+                _tile_zero(0);
+                for(int ko=0; ko<nKt; ko++){
+                    _tile_loadd(4, Arow+ko*KT, I);
+                    _tile_loadd(6, Bt+(int64_t)ko*(KT/4)*NT*4, NT*4);
+                    _tile_dpbssd(0,4,6);
+                }
+                int32_t tmp[16*16]; _tile_stored(0,tmp,NT*4);
+                int mrows=(s0+MT<=S)?MT:(S-s0);
+                for(int m=0;m<mrows;m++){
+                    int s=s0+m; float sxm=sx[s];
+                    float *yr=y+(int64_t)s*O+(int64_t)no*NT;
+                    const int32_t *tr=tmp+m*NT;
+                    for(int n=0;n<NT;n++) yr[n]=(float)tr[n]*sc[n]*sxm;   /* same L-to-R order as VNNI */
+                }
+            }
+        }
+
+        /* --- ragged S edge (S/16 odd): leftover 16-row tile x macro-block O
+         * cols only (the leftover-O corner, if any, was already covered by
+         * the ragged-O branch above) --- */
+        if(nSt_rem){
+            int so=nSb*2, s0=so*MT;
+            const int8_t *Arow=xq+(int64_t)s0*I;
+            #pragma omp for schedule(static)
+            for(int no=0; no<2*nOb; no++){
+                const int8_t *Bt=Bp+(int64_t)no*I*NT;
+                const float *sc=scale+(int64_t)no*NT;
+                _tile_zero(0);
+                for(int ko=0; ko<nKt; ko++){
+                    _tile_loadd(4, Arow+ko*KT, I);
+                    _tile_loadd(6, Bt+(int64_t)ko*(KT/4)*NT*4, NT*4);
+                    _tile_dpbssd(0,4,6);
+                }
+                int32_t tmp[16*16]; _tile_stored(0,tmp,NT*4);
+                int mrows=(s0+MT<=S)?MT:(S-s0);
+                for(int m=0;m<mrows;m++){
+                    int s=s0+m; float sxm=sx[s];
+                    float *yr=y+(int64_t)s*O+(int64_t)no*NT;
+                    const int32_t *tr=tmp+m*NT;
+                    for(int n=0;n<NT;n++) yr[n]=(float)tr[n]*sc[n]*sxm;   /* same L-to-R order as VNNI */
+                }
+            }
+        }
+
+        _tile_release();
+    }
+}
+#endif /* __AMX_INT8__ && __linux__ */
+
 typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch;
 static _Thread_local QScratch g_qscratch;
 static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
@@ -1002,6 +1465,12 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     /* fmt=4: grouped int4 — always use the exact grouped kernel (no IDOT approximation,
      * since the whole point of grouped scales is better quality). */
+#if defined(__AVX512BF16__)
+    /* fmt=5 MXFP4: BF16 dpbf16 kernel wins at S>=g_mxfp4_smin (batch/prefill/multi-stream);
+     * at smaller S it loses to the int4 grouped kernel, but fmt=5 experts have no int4 form,
+     * so below the threshold we still call matmul_mxfp4 (correct, just not the fastest regime). */
+    if(w->fmt==5){ matmul_mxfp4(y,x,w->q4,w->s,S,w->I,w->O); return; }
+#endif
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
      * non ripaga (soglia S>=2); ma su ARM/SDOT il singolo token CONVIENE (vedi g_i4s /
@@ -1020,6 +1489,32 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+#if defined(__AMX_INT8__) && defined(__linux__)
+        /* x86 AMX tile path (Phase 1: resident/dense tensors only, S>=g_amx_smin).
+         * S=1 decode and streaming experts (amx_eligible=0) always stay on VNNI —
+         * validated ~6-8x over VNNI at S=32-128 with B pre-packed, loses at S=1. */
+        if(g_amx && w->amx_eligible && S>=g_amx_smin){
+            if(w->fmt==1) amx_prepack_q8(w); else amx_prepack_i4(w);
+            if(w->amx_packed==1){
+                int O=w->O;
+                int Sfull=(S/AMX_TILE_M)*AMX_TILE_M;
+                if(Sfull>0) matmul_q_idot_mm_amx(y,xq,sx,w->amx_q8,w->s,Sfull,I,O);
+                if(Sfull<S){                 /* ragged S tail: exact VNNI, identical scale order */
+                    if(w->fmt==1){
+                        #pragma omp parallel for schedule(static)
+                        for(int o=0;o<O;o++){ const int8_t *wr=w->q8+(int64_t)o*I; float sc=w->s[o];
+                            for(int s=Sfull;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(wr,xq+(int64_t)s*I,I)*sc*sx[s]; }
+                    } else {
+                        int rb=(I+1)/2;
+                        #pragma omp parallel for schedule(static)
+                        for(int o=0;o<O;o++){ const uint8_t *wr=w->q4+(int64_t)o*rb; float sc=w->s[o];
+                            for(int s=Sfull;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(wr,xq+(int64_t)s*I,I)*sc*sx[s]; }
+                    }
+                }
+                return;
+            }
+        }
+#endif
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
@@ -1192,7 +1687,8 @@ static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (ba
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
-    t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL; t->e8=NULL;
+    t->amx_q8=NULL; t->amx_packed=0; t->amx_eligible=0;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
     else if(bits>=3){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
@@ -1359,6 +1855,13 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
+    /* Resident, loaded once, right here — never a reused/streaming expert
+     * slot (those call qt_from_disk directly; see expert_load). Deliberately
+     * unconditional (not gated on COLI_CUDA/g_cuda_enabled/g_cuda_dense like
+     * cuda_eligible below): cuda_eligible is only ever set to 1 inside
+     * #ifdef COLI_CUDA, so on this CPU-only (CUDA=0) build it is permanently
+     * 0 — reusing it as the AMX gate would silently disable AMX everywhere. */
+    t.amx_eligible=1;
 #ifdef COLI_CUDA
     if(g_cuda_enabled&&g_cuda_dense){
         t.cuda_eligible=1;
@@ -1398,6 +1901,147 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
     int old=-1;for(int i=0;i<g_cuda_ndev;i++)if(g_cuda_devices[i]==l->kv_b.cuda_device)old=i;
     if(old>=0)g_cuda_dense_projected[old]-=qt_bytes(&l->kv_b);
     l->kv_b.cuda_eligible=0;
+}
+#endif
+
+/* fwd decl: expert_load() is defined later (needed by the MVP-1 resident-wire pass
+ * at the end of model_init(), below); real definition + big banner comment near ~2000.
+ * g_mmap moved up from its original spot (right before map_of_fd(), further down) for
+ * the same reason: model_init()'s resident-wire pass reads/forces it before expert_load
+ * runs, and both now need to exist this early in the file. */
+static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal);
+static int g_mmap=0;
+static int g_mxfp4_smin=8;        /* MXFP4_SMIN: min S to use the MXFP4 bf16 kernel (fmt=5); below this the int4/f32 path is faster at decode */
+static int g_instr=0;             /* INSTR=1: MoE kernel-vs-orchestration timing split + pcall count */
+static int g_numa_partition=1;    /* NUMA_PARTITION (default ON): mbind resident expert tensors across
+                                    * NUMA nodes at wire time -- DATA PLACEMENT ONLY, no compute-side
+                                    * thread/node pinning (separate later task). NUMA_PARTITION=0 skips
+                                    * every mbind call = MVP-1 behavior, unchanged, for A/B. */
+#ifdef __linux__
+static int64_t g_numa_placed, g_numa_failed;      /* [numa] summary: tensors placed / mbind failures */
+static unsigned long g_numa_maxnode=8;            /* mbind() maxnode; refined from numa_max_node() in
+                                                    * model_init below once topology is known -- 8 is a
+                                                    * generous, always-safe fallback (see numa_place_range) */
+static inline int expert_node(int eid){ return eid % 3; }  /* deterministic 3-way shard, one per NUMA node */
+/* mbind [addr,addr+len) onto `node` under MPOL_BIND. MPOL_MF_MOVE relocates pages that are
+ * ALREADY resident (e.g. left in the page cache by a previous run) instead of only steering
+ * future page faults -- required here since the 369 GB of shard files are routinely pre-warm-
+ * ed. Page-aligns the start down / length up per mbind(2) (mirrors the existing madvise
+ * alignment idiom in expert_load's g_mmap branch below). maxnode just needs to exceed the
+ * highest bit `nodemask` can have set (2, for a 3-node box) AND stay small enough that the
+ * kernel only reads the one `unsigned long` we actually gave it (<=64) -- g_numa_maxnode
+ * satisfies both by construction. Thread-safe: no shared mutable state besides the atomically
+ * -updated counters, so safe to call from the resident-wire pass's OMP-parallel loop (each
+ * expert's byte ranges are disjoint). */
+static void numa_place_range(void *addr, int64_t len, int node){
+    if(!addr || len<=0) return;
+    uintptr_t a=(uintptr_t)addr, base=a & ~(uintptr_t)4095;
+    size_t rl=((size_t)len + (size_t)(a-base) + 4095) & ~(size_t)4095;
+    unsigned long nodemask=1UL<<node;
+    long rc=mbind((void*)base, rl, MPOL_BIND, &nodemask, g_numa_maxnode, MPOL_MF_MOVE);
+    if(rc==0) __atomic_add_fetch(&g_numa_placed,1,__ATOMIC_RELAXED);
+    else      __atomic_add_fetch(&g_numa_failed,1,__ATOMIC_RELAXED);
+}
+/* Place one QT's weight + scale ranges on `node`. Weight ptr picked the same way
+ * qt_wire_mmap() does (q8 if set, else q4 -- expert_load's g_mmap branch always aliases both
+ * to the same mapped address anyway). scale_b is exact for grouped int4 (fmt==4) too, mir-
+ * roring qt_bytes()'s own weight/scale split rather than qt_wire_mmap's O*4-only shortcut
+ * (harmless there since fmt==4 experts aren't in play for this model, but free to get right). */
+static void numa_place_qt(QT *t, int node){
+    if(!t->q8 && !t->q4) return;
+    void *wp = t->q8 ? (void*)t->q8 : (void*)t->q4;
+    if(t->fmt==5){ /* MXFP4: place nibble weight + E8M0 byte-scale ranges */
+        int64_t wb=(int64_t)t->O*((t->I+1)/2), sb=(int64_t)t->O*((t->I+31)/32);
+        if(wb>0) numa_place_range(wp, wb, node);
+        if(t->e8 && sb>0) numa_place_range((void*)t->e8, sb, node);
+        return; }
+    int64_t scale_b = (t->fmt==4) ? (int64_t)t->O*((t->I+t->gs-1)/t->gs)*4 : (int64_t)t->O*4;
+    int64_t weight_b = qt_bytes(t) - scale_b;
+    if(weight_b>0) numa_place_range(wp, weight_b, node);
+    if(t->s && scale_b>0) numa_place_range((void*)t->s, scale_b, node);
+}
+
+/* ===================== MVP-3b: compute-side NUMA per-node passes =====================
+ * MVP-3a mbind's each expert's weights to expert_node(eid). But expert_gate_up()/matmul_qt()
+ * open their OWN #pragma omp parallel for over the WHOLE pool, so an expert's matmul forks
+ * across all 3 sockets even though its weights live on one node -> cross-socket reads +
+ * fork/join sync. THIS makes the compute match the data: process the block's experts in 3
+ * sequential passes (one per node); before pass n, rebind the OMP pool's threads to node n's
+ * PHYSICAL cores, so the inner parallel-fors land on node-local cores reading node-local data.
+ * Passes are SEQUENTIAL, so the shared out[]/scratch accumulation stays race-free (two experts
+ * on different nodes may write the same position s, but never concurrently). */
+static int   g_numa_compute=1;     /* NUMA_COMPUTE (default ON): the 3-pass per-node compute */
+static int   g_reserve_cores=3;    /* cores/node left free for OS/orchestration/web-streaming */
+static int   g_numa_smin=8;        /* min S (batch rows) to use the 3-pass NUMA compute; below this,
+                                    * the per-pass fork/join + rebind overhead dwarfs the S=1 decode work
+                                    * (bandwidth-bound), so fall back to the single full-pool loop */
+static int   g_nnodes=1;           /* discovered node count */
+static int   g_numa_topo_ready=0;
+static cpu_set_t g_node_cpus[8];   /* physical-core affinity mask per node (HT siblings excluded) */
+static cpu_set_t g_all_cpus;       /* union of all cores (for unbinding the pool after passes) */
+static int   g_node_ncpu[8];       /* usable compute cores/node after reserve */
+static int   g_pool_bound_node=-1; /* last node the pool was rebound to (avoid redundant rebinds) */
+
+/* Build per-node PHYSICAL-core cpu_set_t's. A physical core and its HT sibling share a NUMA
+ * node; we keep only the LOWER-numbered thread of each core (the box lists phys cores first,
+ * then all HT siblings, e.g. node0 = 0-42 then 128-170). Heuristic: a cpu is "physical" if its
+ * id is below (total_cpus/2). Reserve g_reserve_cores of each node for the OS. */
+static void numa_topo_init(void){
+    if(g_numa_topo_ready) return;
+    g_numa_topo_ready=1;
+    int maxn=numa_max_node();
+    g_nnodes = maxn<0 ? 1 : maxn+1;
+    if(g_nnodes>8) g_nnodes=8;
+    long ncpu_total = sysconf(_SC_NPROCESSORS_CONF);
+    long phys_cut = ncpu_total>0 ? ncpu_total/2 : 0;   /* ids >= this are HT siblings */
+    struct bitmask *bm = numa_allocate_cpumask();
+    for(int n=0;n<g_nnodes;n++){
+        CPU_ZERO(&g_node_cpus[n]); g_node_ncpu[n]=0;
+        int got=0;
+        if(numa_node_to_cpus(n, bm)==0){
+            for(int cpu=0; cpu<(int)bm->size; cpu++){
+                if(!numa_bitmask_isbitset(bm,cpu)) continue;
+                if(phys_cut>0 && cpu>=phys_cut) continue;   /* skip HT sibling */
+                got++;
+            }
+            /* second pass: add all-but-reserve of the physical cores */
+            int keep = got - g_reserve_cores; if(keep<1) keep=got>0?got:1;
+            int added=0;
+            for(int cpu=0; cpu<(int)bm->size && added<keep; cpu++){
+                if(!numa_bitmask_isbitset(bm,cpu)) continue;
+                if(phys_cut>0 && cpu>=phys_cut) continue;
+                CPU_SET(cpu,&g_node_cpus[n]); added++;
+            }
+            g_node_ncpu[n]=added;
+        }
+    }
+    numa_free_cpumask(bm);
+    CPU_ZERO(&g_all_cpus);
+    for(long cpu=0; cpu<ncpu_total; cpu++) CPU_SET((int)cpu,&g_all_cpus);
+    fprintf(stderr,"[numa-compute] %d nodes, cores/node:", g_nnodes);
+    for(int n=0;n<g_nnodes;n++) fprintf(stderr," n%d=%d", n, g_node_ncpu[n]);
+    fprintf(stderr," (reserve %d)\n", g_reserve_cores);
+}
+
+/* Rebind every thread of the current OpenMP pool to node n's physical cores. Cheap (~us):
+ * one parallel region, each thread calls pthread_setaffinity_np(self, node_n_mask). Run once
+ * per pass; skip if already bound to n. Sizing the pool to node cores is done by the caller
+ * via omp_set_num_threads(g_node_ncpu[n]) before the compute parallel-for. */
+static void numa_bind_pool_to_node(int n){
+    if(n<0||n>=g_nnodes||g_node_ncpu[n]<=0) return;
+    if(g_pool_bound_node==n) return;
+    cpu_set_t set = g_node_cpus[n];
+    #pragma omp parallel
+    { pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set); }
+    g_pool_bound_node=n;
+}
+/* Unbind the pool: rebind every OMP thread to ALL cores. Called after the per-node passes so
+ * subsequent full-pool regions aren't stuck on one node's cores. */
+static void numa_pool_unbind(void){
+    cpu_set_t set = g_all_cpus;
+    #pragma omp parallel
+    { pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set); }
+    g_pool_bound_node=-1;
 }
 #endif
 
@@ -1502,7 +2146,13 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->sh_gate = qt_load(m,PM("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,PM("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,PM("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
-            m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
+            {   char ehf[300]; snprintf(ehf,sizeof(ehf),"model.layers.%d.eh_proj.weight.f32",i);
+                if(st_has(&m->S,ehf)){
+                    QT t; memset(&t,0,sizeof(t)); t.fmt=0; t.O=D; t.I=2*D; t.amx_eligible=1;
+                    t.qf=(float*)qalloc((int64_t)D*2*D*sizeof(float)); st_read_f32(&m->S,ehf,t.qf,0);
+                    m->eh_proj=t; fprintf(stderr,"[MTP] eh_proj loaded at F32 (full precision)\n");
+                } else m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
+            }
             m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
             m->mtp_norm=ld(m,PM("shared_head.norm.weight"));
             m->ecache[i]=calloc(cap,sizeof(ESlot));
@@ -1558,6 +2208,73 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
         rb+=qt_bytes(&m->ix_wq[i])+qt_bytes(&m->ix_wk[i])+qt_bytes(&m->ix_wp[i]);
     m->resident_bytes=rb;
+    /* MVP-1 RESIDENT: wire EVERY routed expert of EVERY sparse layer (+ the MTP row, if
+     * present) into RAM ONCE, here, via the EXISTING expert_load() -- exactly what
+     * pin_load() already does for a hand-picked subset, made total and unconditional.
+     * moe()'s RESOLVE SCAN then indexes m->experts[layer][eid] directly: no pin/ecache
+     * scan, no miss, no disk. Default ON; RESIDENT=0 falls back untouched to the
+     * original pin/ecache/miss streaming path in moe() (A/B, same binary). */
+    m->resident = getenv("RESIDENT")==NULL || atoi(getenv("RESIDENT"))!=0;
+    if(m->resident){
+        /* g_mmap is what makes expert_load()'s load a zero-copy VIEW into the page
+         * cache instead of a malloc'd slab + pread COPY -- required for "resident via
+         * mmap = zero extra malloc". Force it on so RESIDENT=1 can never silently
+         * regress into a few-hundred-GB private-copy load if COLI_MMAP=1 was omitted. */
+        if(!g_mmap){
+            fprintf(stderr,"[resident] COLI_MMAP was off; forcing g_mmap=1 (resident wiring "
+                            "requires zero-copy mmap views into the page cache)\n");
+            g_mmap=1;
+        }
+        int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
+        int nrows=nsp+(m->has_mtp?1:0);
+        fprintf(stderr,"[resident] wiring %d sparse layers%s x %d experts = %d ESlots, "
+                        "resident-in-RAM (mmap-view + prefault; this blocks for a while)...\n",
+                nsp, m->has_mtp?" +1 MTP row":"", c->n_experts, nrows*c->n_experts);
+        double t0=now_s(); int64_t wired_bytes=0;
+        m->experts=calloc(NR,sizeof(ESlot*));
+#ifdef __linux__
+        /* NUMA_PARTITION data placement (this task's scope: placement only, no compute-side
+         * thread/node pinning). Refine maxnode from real topology now that the model is
+         * loaded; numa_max_node()<0 means NUMA is unavailable (e.g. single-node box/container)
+         * -- fall back to the safe default set at declaration and just let every mbind target
+         * node 0 (expert_node()%3 still runs, but there's only one node to land on anyway). */
+        if(g_numa_partition){
+            int mn=numa_max_node();
+            if(mn>=0) g_numa_maxnode=(unsigned long)mn+2;
+            fprintf(stderr,"[numa] NUMA_PARTITION=1: mbind-placing experts across %d node(s) "
+                            "(expert_node=eid%%3)\n", mn>=0?mn+1:1);
+        } else {
+            fprintf(stderr,"[numa] NUMA_PARTITION=0: skipping mbind placement (MVP-1 behavior)\n");
+        }
+#endif
+        for(int i=0;i<NR;i++){
+            if(i<c->n_layers && !m->L[i].sparse) continue;
+            if(i==c->n_layers && !m->has_mtp) continue;
+            ESlot *row=calloc(c->n_experts,sizeof(ESlot));
+            m->experts[i]=row;
+            #pragma omp parallel for schedule(dynamic,1)
+            for(int e=0;e<c->n_experts;e++){
+                expert_load(m,i,e,&row[e],1);
+#ifdef __linux__
+                if(g_numa_partition){
+                    int node=expert_node(e);
+                    numa_place_qt(&row[e].g,node);
+                    numa_place_qt(&row[e].u,node);
+                    numa_place_qt(&row[e].d,node);
+                }
+#endif
+            }
+            for(int e=0;e<c->n_experts;e++)
+                wired_bytes += qt_bytes(&row[e].g)+qt_bytes(&row[e].u)+qt_bytes(&row[e].d);
+        }
+        m->resident_bytes += wired_bytes;
+#ifdef __linux__
+        fprintf(stderr,"[numa] placed %lld expert tensors, %lld mbind failures\n",
+                (long long)g_numa_placed,(long long)g_numa_failed);
+#endif
+        fprintf(stderr,"[resident] wired %d rows, %.1f GB of experts, in %.1fs\n",
+                nrows, wired_bytes/1e9, now_s()-t0);
+    }
 }
 
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
@@ -1577,8 +2294,9 @@ static void embed_row(Model *m, int tok, float *x){
 /* COLI_MMAP=1: gli expert diventano VISTE dentro mmap dei file safetensors (niente pread,
  * niente slab, niente copia: la page cache del kernel E' la cache). Le mappe sono
  * registrate con Metal (newBufferWithBytesNoCopy su pagine file-backed, come llama.cpp),
- * quindi la GPU legge gli stessi byte. Fallback allo slab path su disallineamento. */
-static int g_mmap=0;
+ * quindi la GPU legge gli stessi byte. Fallback allo slab path su disallineamento.
+ * (g_mmap itself is declared above, before model_init(): the MVP-1 resident-wire pass
+ * needs to read/force it at load time, earlier in the file than this comment block.) */
 static struct { int fd; void *base; size_t len; } g_maps[512]; static int g_nmaps;
 static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e' OMP-parallel */
 /* forward decls: mem_should_wire/mem_wire live near pin_wire() further down, but
@@ -1648,18 +2366,21 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
     char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
-    if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime.
-                                                  * Reachable ONLY for unquantized models (no .qs);
-                                                  * GLM always has .qs, so the pilot never hits it. */
+    char qnmx[320]; snprintf(qnmx,sizeof(qnmx),"%s_scale",nm[0]);
+    if(!st_has(&m->S,qn) && !st_has(&m->S,qnmx)){ /* fallback: tensori pieni, quantizza a runtime.
+                                                  * Reachable ONLY for unquantized models (no .qs and
+                                                  * no MXFP4 .weight_scale); GLM always has one. */
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
         s->eid=eid; return 0;
     }
-    st_tensor *tw[3], *tq[3];
+    st_tensor *tw[3], *tq[3]; int is_mx[3]={0,0,0};
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
+        if(!tq[k]){ /* MXFP4 (fmt=5): E8M0 byte scales in a .weight_scale sidecar */
+            snprintf(qn,sizeof(qn),"%s_scale",nm[k]); tq[k]=st_find(&m->S,qn); if(tq[k]) is_mx[k]=1; }
         if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); if(fatal) exit(1); return -1; }
     }
     if(g_disk_split){ /* split load/byte per tipo layer; atomici: expert_load gira anche su OMP/pipe/pilot */
@@ -1673,7 +2394,8 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         void *bw[3],*bq[3]; int okm=1;
         for(int k=0;k<3;k++){
             bw[k]=map_of_fd(tw[k]->fd); bq[k]=map_of_fd(tq[k]->fd);
-            if(!bw[k]||!bq[k]||((tw[k]->off)&3)||((tq[k]->off)&3)) okm=0;
+            if(!bw[k]||!bq[k]||((tw[k]->off)&3)) okm=0;
+            if(!is_mx[k] && ((tq[k]->off)&3)) okm=0;  /* f32 scales need 4-align; MXFP4 E8M0 bytes don't */
         }
         if(okm){
             QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
@@ -1682,11 +2404,15 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                 int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
                 /* detect grouped int4 (fmt=4): int4 weight bytes + larger scale array */
                 int gs=0;
-                if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
-                if(gs>0) fmt=4;
-                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
+                if(is_mx[k]){ fmt=5; gs=32; }   /* MXFP4: E2M1 nibbles + E8M0 byte scales, gs=32 */
+                else { if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes); if(gs>0) fmt=4; }
+                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL; qt[k]->e8=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
-                qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
+                if(fmt==5){ qt[k]->e8=(uint8_t*)((char*)bq[k]+tq[k]->off);
+                    int ng5=(II[k]+31)/32; int64_t nsc=(int64_t)OO[k]*ng5;
+                    qt[k]->s=malloc(nsc*sizeof(float));   /* precompute E8M0->f32 once (kills per-call ldexpf) */
+                    for(int64_t z=0;z<nsc;z++) qt[k]->s[z]=ldexpf(1.0f,(int)qt[k]->e8[z]-127); }
+                else       qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
             }
             /* CPU pre-touch: fault the pages in HERE (cheap, parallel, overlapped with the
              * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
@@ -2133,7 +2859,8 @@ static void expert_host_release(Model *m, ESlot *s){
      * re-alloc and never reaches here with an aligned fslab on _WIN32). */
     compat_aligned_free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
     QT *q[3]={&s->g,&s->u,&s->d};
-    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL;
+        q[k]->amx_q8=NULL; q[k]->amx_packed=0; }
     m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
 }
 static void expert_host_ensure(Model *m, int layer, ESlot *s){
@@ -2648,6 +3375,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * nell'ordine (routed nel loro ordine di union, poi shared). */
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
 static int expert_is_resident(Model *m, int layer, int eid){
+    if(m->resident) return 1;   /* MVP-1: everything is always resident -- no pin/ecache to scan */
     ESlot *P=m->pin[layer];
     for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return 1;
     ESlot *Sl=m->ecache[layer];
@@ -2858,8 +3586,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
      * only drop from misses. From the misses, keep the highest-aggregate-gate-weight
      * ones up to the budget; drop the rest from idxs[] so they're never loaded.
      * (MoE-Spec arXiv 2602.16052: top-32 of 64 capture 93% routing weight.)
+     * Disabled under RESIDENT: there is no disk I/O to budget for (everything is
+     * always resident), and the pin/ecache hit-scan below would see nhits==0 for
+     * every expert and wrongly start dropping routed experts from real requests.
      * Complementary to TOPP (per-position) — this trims cross-position. */
-    if(g_expert_budget>0 && nu>g_expert_budget){
+    if(g_expert_budget>0 && nu>g_expert_budget && !m->resident){
         /* compute aggregate gate weight per unique expert */
         float *wsum=falloc(nu); for(int j=0;j<nu;j++) wsum[j]=0;
         for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
@@ -2917,6 +3648,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
+    /* fmt=5 MXFP4 batch-union bf16 activation scratch (converted once per expert, reused by gate+up+down) */
+    uint16_t *xg_bf=NULL,*gg_bf=NULL;
+    if(l->gate_proj.fmt==5 || (m->experts && m->experts[layer] && m->experts[layer][0].g.fmt==5)){
+        xg_bf=malloc((int64_t)S*D*sizeof(uint16_t)); gg_bf=malloc((int64_t)S*I*sizeof(uint16_t)); }
 #ifdef COLI_CUDA
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
@@ -2928,16 +3663,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
 #endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
+    int _moe_save_nth=omp_get_max_threads();   /* restored after the expert loop (NUMA passes shrink the pool) */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
-            ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
-            if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
-            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
-                if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
+        if(m->resident){
+            /* MVP-1 RESIDENT: every routed expert of this (sparse) layer was wired into
+             * m->experts[layer][eid] once at model load (model_init) -- direct index,
+             * always a hit, never a miss. use[] keeps IDENTICAL semantics for the
+             * COMPUTE region below (ESlot* with valid ->g/->u/->d QT). */
+            for(int j=0;j<nb;j++){ use[j]=&m->experts[layer][uniq[base+j]]; qof[j]=-1; m->hits++; }
+        } else {
+            for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
+                ESlot *P=m->pin[layer];
+                for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
+                if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
+                    for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
+                if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
+                    if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
+            }
         }
         int metal_done=0;
 #ifdef COLI_METAL
@@ -2999,8 +3743,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         /* Expert loads run HERE, after the resident-experts GPU submit above: under METAL the
          * preads overlap the GPU compute (that submit is async). With METAL off the submit block
          * is a no-op / compiled out, so this sits exactly where dev put it and CPU behaviour is
-         * unchanged. */
-        if(nmiss){
+         * unchanged. MVP-1 RESIDENT: nmiss is always 0 in resident mode (every use[j] above was
+         * already a hit into m->experts[]), so this whole disk-load block is naturally dead --
+         * guarded explicitly anyway (!m->resident) so it reads as intentionally retired, not
+         * merely inert, and stays fully live for RESIDENT=0 A/B. */
+        if(!m->resident && nmiss){
             if(g_pipe){                            /* PIPE: launch loads async, matmul overlaps them */
                 if(!g_pp.started) pipe_init(m);
                 double t0=now_s();
@@ -3013,8 +3760,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->t_ewait += now_s()-t0; }        /* blocking: whole load stalls compute */
         }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
-         * questo — il kernel legge in background, le pread dopo trovano cache calda */
-        if(base+64<nu){
+         * questo — il kernel legge in background, le pread dopo trovano cache calda.
+         * MVP-1 RESIDENT: retired -- there is no next block to read ahead of, everything
+         * is already resident. */
+        if(!m->resident && base+64<nu){
             int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
             for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
                 ESlot *P=m->pin[layer];
@@ -3055,8 +3804,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         #undef MB_BUILD
 #endif
+        /* MVP-3b: compute-side NUMA. When active, wrap the expert loop in 3 sequential
+         * per-node passes; before each pass rebind the OMP pool to that node's physical cores
+         * and size it to that node's core count, and skip experts not owned by this node
+         * (expert_node(eid)!=pass). So each expert's inner parallel-for runs node-local on
+         * node-local weights. Sequential passes keep the shared out[]/scratch race-free.
+         * When inactive (streaming, CUDA/METAL, or NUMA_COMPUTE=0), pass range is a single
+         * catch-all pass (-1) and the loop is byte-identical to before. */
+        int _nc_on = 0;
+#ifdef __linux__
+        _nc_on = (g_numa_compute && m->resident && g_nnodes>1 && S>=g_numa_smin);
+        int _save_nth = _nc_on ? omp_get_max_threads() : 0;
+#endif
+        int _pass_lo = _nc_on ? 0 : -1;
+        int _pass_hi = _nc_on ? g_nnodes-1 : -1;
         if(!metal_done)
+        for(int _pass=_pass_lo; _pass<=_pass_hi; _pass++){
+#ifdef __linux__
+        if(_nc_on){ numa_bind_pool_to_node(_pass); omp_set_num_threads(g_node_ncpu[_pass]); }
+#endif
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+#ifdef __linux__
+            if(_nc_on && expert_node(eid)!=_pass) continue;
+#endif
             /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
              * dispatched slot must be waited before the end-of-block LRU swap can reuse
              * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant.
@@ -3081,7 +3851,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 ngroup++; continue;
             }
 #endif
+            double _tg0=now_s();
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
+            if(g_instr) m->t_moe_orch += now_s()-_tg0;
             double t0=now_s();
 #ifdef COLI_CUDA
             if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
@@ -3093,13 +3865,45 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
-            expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-            matmul_qt(hh, gg, &e->d, nr);
+            double _tk0=now_s();
+#if defined(__AVX512BF16__)
+            if(e->g.fmt==5){
+                /* batch-union: convert gathered rows to bf16 ONCE, then gate+up+down read bf16 */
+                double _tc=now_s();
+                f32_to_bf16_buf(xg_bf, xg, (int64_t)nr*D);
+                if(g_instr) m->t_moe_conv += now_s()-_tc;
+                double _tkk=now_s();
+                matmul_mxfp4_bf16(gg, xg_bf, e->g.q4, e->g.s, nr, D, I);
+                matmul_mxfp4_bf16(uu, xg_bf, e->u.q4, e->u.s, nr, D, I);
+                if(g_instr){ m->t_moe_kernel += now_s()-_tkk; m->moe_pcalls += 2; }
+                for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                _tc=now_s();
+                f32_to_bf16_buf(gg_bf, gg, (int64_t)nr*I);
+                if(g_instr) m->t_moe_conv += now_s()-_tc;
+                _tkk=now_s();
+                matmul_mxfp4_bf16(hh, gg_bf, e->d.q4, e->d.s, nr, I, D);
+                if(g_instr){ m->t_moe_kernel += now_s()-_tkk; m->moe_pcalls += 1; }
+            } else
+#endif
+            { expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+              for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+              matmul_qt(hh, gg, &e->d, nr); }
+            if(g_instr){ m->t_moe_kernel += now_s()-_tk0; m->moe_pcalls += 3; }  /* gate+up+down = 3 parallel regions (fmt=4) */
+            double _ts0=now_s();
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+            if(g_instr) m->t_moe_orch += now_s()-_ts0;
             m->t_emm += now_s()-t0;
         }
+        }   /* end MVP-3b per-node _pass loop */
+#ifdef __linux__
+        /* NOTE: pool is intentionally LEFT bound to the last pass's node across the base-block
+         * boundary — numa_bind_pool_to_node()'s g_pool_bound_node guard then skips the redundant
+         * rebind at the next block's pass 0 (same node), eliminating the per-block
+         * unbind->rebind #pragma-omp-parallel churn that made the MXFP4 kernel ~10x slower.
+         * A single numa_pool_unbind()+thread-count restore runs ONCE after the whole expert
+         * loop (below), before the shared expert / next layer. _save_nth captured on first block. */
+#endif
 #ifdef COLI_CUDA
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
         ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
@@ -3149,8 +3953,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         /* No drain barrier: the per-expert pipe_wait(qof[j]) above (issued for every
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
-         * cursor keeps any still-spinning worker off a wrong-generation slot. */
-        { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
+         * cursor keeps any still-spinning worker off a wrong-generation slot.
+         * MVP-1 RESIDENT: retired -- nmiss==0 always, there is nothing in m->ws[] to
+         * promote, and m->ecache[]/m->ecn[] are intentionally never populated. */
+        if(!m->resident){ ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
@@ -3158,6 +3964,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
+#ifdef __linux__
+    /* ONE unbind+restore after the whole expert loop (was per-block -> churned the OMP pool). */
+    if(g_numa_compute && g_pool_bound_node>=0){ numa_pool_unbind(); omp_set_num_threads(_moe_save_nth); }
+#endif
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
     if(!with_shared) goto shared_done;
     {
@@ -3192,6 +4002,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
+    if(xg_bf) free(xg_bf); if(gg_bf) free(gg_bf);
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
     free(group_row); free(group_weight);
@@ -3915,7 +4726,7 @@ static int mtp_argmax(const float *lo, int V){
 }
 static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
-    int p=kv-1; if(p<0||G<1) return 0;
+    int p=kv; if(p<0||G<1) return 0;   /* Bug B: pos of the EMBEDDED token (ref positions[]), was kv-1 */
     if(m->kv_start[li]<0 || m->kv_start[li]>p) m->kv_start[li]=p;
     float *x=falloc(D), *cat=falloc(2*D), *hx=falloc(D), *nrm=falloc(D), *tmp=falloc(D);
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
@@ -3944,7 +4755,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
         int t2=mtp_argmax(logit, c->vocab);
         if(dbg) fprintf(stderr,"[mtp2] pos=%d in_tok=%d ||eh||=%.1f ||post||=%.1f pre_blk=%d post_blk=%d\n",
                         pos, tok, sqrt(n_eh), sqrt(n_post), t_pre, t2);
-        draft[n++]=t2; tok=t2; memcpy(h, hx, D*sizeof(float));
+        draft[n++]=t2; tok=t2; memcpy(h, row, D*sizeof(float));   /* Bug A fix: chain shared_head.norm(hx)=row, not raw hx (ref: DeepseekModelNextN spec_info.hidden_states is post-shared_head.norm) */
     }
     m->ld_ctx=0;
     free(x); free(cat); free(hx); free(nrm); free(tmp); free(row); free(logit); free(h);
@@ -3956,7 +4767,8 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base){
     if(!m->has_mtp || S<1) return;
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
-    if(m->kv_start[li]<0 || m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
+    int pb=pos_base+1;   /* Bug B: MTP layer KV row = position+1, matches mtp_draft p=kv */
+    if(m->kv_start[li]<0 || m->kv_start[li]>pb) m->kv_start[li]=pb;
     float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
     int prenorm = getenv("MTP_PRENORM")!=NULL;
     for(int i=0;i<S;i++){
@@ -3971,7 +4783,7 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
     m->ld_ctx=2;                                 /* DISK_SPLIT: load del layer MTP in absorb */
-    layer_forward(m,&m->mtpL,li,hx,S,pos_base,nrm,tmp);
+    layer_forward(m,&m->mtpL,li,hx,S,pb,nrm,tmp);
     m->ld_ctx=0;
     free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
 }
@@ -4348,6 +5160,8 @@ static void profile_print(Model *m, double elapsed){
         m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
+    if(g_instr) printf("MOE-SPLIT: kernel %.3fs | bf16-conv %.3fs | orchestration %.3fs | parallel-region launches %llu\n",
+        m->t_moe_kernel, m->t_moe_conv, m->t_moe_orch, (unsigned long long)m->moe_pcalls);
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
@@ -4362,6 +5176,7 @@ static void profile_print(Model *m, double elapsed){
 static void profile_reset(Model *m){
     m->t_edisk=m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
     m->t_aproj=m->t_acore=m->t_aout=0;
+    m->t_moe_kernel=m->t_moe_orch=m->t_moe_conv=0; m->moe_pcalls=0;
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -5734,6 +6549,16 @@ int main(int argc, char **argv){
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_mmap = getenv("COLI_MMAP")?atoi(getenv("COLI_MMAP")):0;
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
+#ifdef __linux__
+    g_numa_partition = getenv("NUMA_PARTITION")?atoi(getenv("NUMA_PARTITION")):1;
+    g_numa_compute   = getenv("NUMA_COMPUTE")?atoi(getenv("NUMA_COMPUTE")):1;
+    g_instr          = getenv("INSTR")?atoi(getenv("INSTR")):0;
+    g_mxfp4_smin     = getenv("MXFP4_SMIN")?atoi(getenv("MXFP4_SMIN")):8;
+    g_reserve_cores  = getenv("RESERVE_CORES")?atoi(getenv("RESERVE_CORES")):3;
+    g_numa_smin      = getenv("NUMA_COMPUTE_SMIN")?atoi(getenv("NUMA_COMPUTE_SMIN")):8;
+    if(g_reserve_cores<0) g_reserve_cores=0;
+    if(g_numa_compute) numa_topo_init();   /* build per-node physical-core cpu_sets */
+#endif
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     g_expert_budget = getenv("EXPERT_BUDGET")?atoi(getenv("EXPERT_BUDGET")):0;
@@ -5810,6 +6635,22 @@ int main(int argc, char **argv){
 #endif
     }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+#if defined(__AMX_INT8__) && defined(__linux__)
+    /* amx_enable() must run on the main thread, once, before any _tile_*
+     * intrinsic anywhere (tile CONFIG is per-thread and loaded separately
+     * inside each OMP region — see matmul_q_idot_mm_amx). A failure here
+     * must never abort: just disable AMX and stay on the VNNI path. */
+    g_amx = (amx_enable()==0);
+    if(!g_amx) fprintf(stderr,"[AMX] arch_prctl XTILEDATA failed; falling back to VNNI\n");
+    if(getenv("AMX")) g_amx = atoi(getenv("AMX")) && (amx_enable()==0);
+    g_amx_smin = getenv("AMX_SMIN")?atoi(getenv("AMX_SMIN")):16;
+#else
+    g_amx = 0;
+    (void)g_amx_smin;   /* unused on this build: every reader is __AMX_INT8__-gated */
+    if(getenv("AMX") && atoi(getenv("AMX")))
+        fprintf(stderr,"[AMX] requested but this binary was built without AMX "
+                       "(needs -march=native on a GNR+ x86 Linux host); falling back to VNNI\n");
+#endif
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
@@ -5884,7 +6725,7 @@ int main(int argc, char **argv){
         return 2;
     }
 #endif
-    printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
+    printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " | amx: %s ==\n", cap, ebits, dbits, g_amx?"on":"off");
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0){
@@ -5904,17 +6745,23 @@ int main(int argc, char **argv){
 #endif
     }
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
-    printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
-           now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
-           m.has_mtp?"ACTIVE":"absent", g_draft);
+    printf("loaded in %.2fs | resident %s: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d) | RESIDENT=%d\n",
+           now_s()-t0, m.resident?"total (dense+ALL experts)":"dense", m.resident_bytes/(1024.0*1024.0),
+           m.c.n_layers, m.c.n_experts, m.has_mtp?"ACTIVE":"absent", g_draft, m.resident);
     /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
     fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"active: native speculative decoding":"absent", g_draft);
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"WARNING: the model is on %s (slow 9p/Windows filesystem; fadvise is ineffective).\n"
                        "         Keep it on ext4 (for example, /home/...) for memory efficiency and speed.\n", snap);
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
-     * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
-    if(getenv("PIN")){
+     * Va PRIMA di cap_for_ram: i pinnati contano nel residente.
+     * MVP-1 RESIDENT: every expert is already pinned (m->experts[]); pin_load()'s
+     * pin[]/npin[] would be redundant (and PIN's own residency pre-scan uses pin/ecache,
+     * which RESIDENT deliberately never populates) -- resident wiring is the single
+     * source of truth, so PIN is a no-op (with a heads-up) while RESIDENT=1. */
+    if(getenv("PIN") && m.resident)
+        fprintf(stderr,"[resident] PIN=%s ignored: RESIDENT=1 already holds every expert in RAM\n",getenv("PIN"));
+    else if(getenv("PIN")){
         const char *pin_gb=getenv("PIN_GB");
         pin_load(&m,getenv("PIN"),pin_gb&&!strcmp(pin_gb,"all")?-1.0:pin_gb?atof(pin_gb):10.0);   /* PIN_GB=all (#80) */
     }
@@ -5934,7 +6781,7 @@ int main(int argc, char **argv){
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
-      if(!getenv("PIN") && autopin && hist>=5000){
+      if(!getenv("PIN") && autopin && hist>=5000 && !m.resident){
           /* quota pin proporzionale alla FIDUCIA nella storia: con pochi dati il pin
            * sbaglia expert e ruba slot alla LRU adattiva; a regime (>=200k selezioni,
            * qualche ora di chat) arriva a meta' del budget expert. */
@@ -5943,8 +6790,9 @@ int main(int argc, char **argv){
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb);
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
-       * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
-      cap_for_ram(&m, ram_env, ebits, est_ctx); }
+       * RAM_GB assente o <=0 = budget automatico da MemAvailable.
+       * MVP-1 RESIDENT: no LRU to clamp (m->ecache[] stays empty by construction), skip. */
+      if(!m.resident) cap_for_ram(&m, ram_env, ebits, est_ctx); }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */

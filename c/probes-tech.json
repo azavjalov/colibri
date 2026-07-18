@@ -1,0 +1,58 @@
+{
+  "_comment": "Domain-focused probe set for Alexei's workloads: coding (multiple langs), systems/OS/driver code, platform & software architecture, ESXi/hypervisor code analysis. Plus contrast categories (prose, math, translation) so specialization contrast is measurable. 4 prompts/category, varied phrasing, lengths in a narrow band. Goal: does GLM-5.2's router concentrate on these technical domains enough to exploit a hot-expert tier?",
+
+  "code_c_systems": [
+    "Write a C function that safely copies a fixed-size buffer and returns the number of bytes written.",
+    "In C, explain how a memory barrier prevents instruction reordering on a multicore CPU.",
+    "Refactor this C loop to reduce cache misses when iterating a large struct array.",
+    "Write a C signal handler that is async-signal-safe and explain why printf is not."
+  ],
+  "code_kernel_driver": [
+    "Explain how a Linux character device driver registers a file_operations struct and handles ioctl.",
+    "Write the probe and remove functions for a minimal PCI driver in the Linux kernel.",
+    "Describe how DMA-coherent memory is allocated and mapped for a device in a kernel driver.",
+    "Explain how an interrupt handler top-half and bottom-half (tasklet/workqueue) split work."
+  ],
+  "esxi_hypervisor": [
+    "Explain how an ESXi native driver differs from a vmklinux driver and why VMware deprecated vmklinux.",
+    "Describe how a VMkernel module registers with the VMKAPI device layer to expose a network uplink.",
+    "How does ESXi PCI passthrough (DirectPath I/O) present a physical device to a guest VM?",
+    "Explain how the ESXi world scheduler places vCPU worlds across pCPUs and NUMA nodes."
+  ],
+  "software_architecture": [
+    "Explain the trade-offs between a monolith and microservices for a latency-sensitive service.",
+    "Describe how you would design a write-ahead log for durability in a storage engine.",
+    "Compare an actor model and a shared-memory threading model for a high-concurrency server.",
+    "Explain how a consistent-hashing ring distributes keys and handles node addition and removal."
+  ],
+  "code_python": [
+    "Write a Python function that merges two sorted lists into one sorted list.",
+    "In Python, explain the difference between a generator and a list comprehension.",
+    "Refactor this Python snippet to avoid a nested loop: for a in xs: for b in ys: if a==b: out.append(a).",
+    "Write a Python context manager that times the block it wraps and logs the duration."
+  ],
+  "code_sql": [
+    "Write a SQL query that returns the top 5 customers by total order value.",
+    "Explain what a LEFT JOIN does differently from an INNER JOIN in SQL.",
+    "Write SQL to add an index on the email column of a users table and explain when it helps.",
+    "Explain how a query planner decides between a hash join and a nested-loop join."
+  ],
+  "prose_story": [
+    "Write the opening paragraph of a short story about a lighthouse keeper.",
+    "Describe a bustling market square using only sensory detail, no dialogue.",
+    "Write a reflective diary entry about the last day of summer.",
+    "Compose a brief character sketch of an old clockmaker who never sleeps."
+  ],
+  "math_proof": [
+    "Prove that the square root of 2 is irrational.",
+    "Show that the sum of the first n odd numbers equals n squared.",
+    "Explain why the derivative of e^x is e^x.",
+    "Prove that there are infinitely many prime numbers."
+  ],
+  "translation_de": [
+    "Translate to German: The network driver failed to allocate a DMA buffer.",
+    "Translate to German: Please restart the hypervisor after applying the patch.",
+    "Translate to German: The scheduler balances virtual CPUs across physical cores.",
+    "Translate to German: Memory pressure caused the guest to be swapped to disk."
+  ]
+}
