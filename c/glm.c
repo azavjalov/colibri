@@ -2889,6 +2889,10 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
         for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=c*((int)(b&0xF)-8); acc[i+1]+=c*((int)(b>>4)-8); }
         if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); } return; }
+    if(t->fmt==4){ int gs=t->gs>0?t->gs:1, ng=(I+gs-1)/gs; const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
+        const float *scl=t->s+(int64_t)row*ng;
+        for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=coef*scl[i/gs]*((int)(b&0xF)-8); acc[i+1]+=coef*scl[(i+1)/gs]*((int)(b>>4)-8); }
+        if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=coef*scl[(I-1)/gs]*((int)(b&0xF)-8); } return; }
     const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
     for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc[i]+=c*((int)((b>>((i&3)*2))&3)-2); }
 }
@@ -2902,6 +2906,12 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
         else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
             for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
             if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
+        else if(t->fmt==4){ int gs=t->gs>0?t->gs:1, ng=(I+gs-1)/gs; const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
+            const float *scl=t->s+(int64_t)row*ng; double aa=0;
+            for(int g=0; g*gs<I; g++){ int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base; float acc=0;
+                for(int i=base;i+1<base+glen;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+                if(glen&1){ int i=base+glen-1; uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]; }
+                aa+=(double)(acc*scl[g]); } a=aa; }
         else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
         y[j]=(float)a;
