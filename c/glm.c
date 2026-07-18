@@ -379,6 +379,22 @@ static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
     }
     return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
 }
+/* fmt=4 dequant-AXPY: acc[i]+=cs*(nibble_i-8) for a contiguous run of n nibbles.
+ * Same nibble unpack as dot_i4f_avx512, but FMA into acc (load-modify-store).
+ * Returns count of nibbles consumed (multiple of 32); caller handles the tail. */
+static inline int axpy_i4f_avx512(const uint8_t *w,float cs,float *acc,int n){
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
+    const __m512 vcs=_mm512_set1_ps(cs); int i=0;
+    for(;i+32<=n;i+=32){ __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+        __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+        __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+        _mm512_storeu_ps(acc+i,    _mm512_fmadd_ps(vcs,w0,_mm512_loadu_ps(acc+i)));
+        _mm512_storeu_ps(acc+i+16, _mm512_fmadd_ps(vcs,w1,_mm512_loadu_ps(acc+i+16)));
+    }
+    return i;
+}
 /* selftest contro il riferimento scalare (I4_ACC512_TEST=1): copre l'ordine dei
  * nibble e ogni multiplo di 32. / selftest vs the scalar reference. */
 static int i4_acc512_selftest(void){
@@ -2891,8 +2907,14 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
         if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); } return; }
     if(t->fmt==4){ int gs=t->gs>0?t->gs:1, ng=(I+gs-1)/gs; const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
         const float *scl=t->s+(int64_t)row*ng;
-        for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=coef*scl[i/gs]*((int)(b&0xF)-8); acc[i+1]+=coef*scl[(i+1)/gs]*((int)(b>>4)-8); }
-        if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=coef*scl[(I-1)/gs]*((int)(b&0xF)-8); } return; }
+        for(int g=0; g*gs<I; g++){ int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+            float cs=coef*scl[g]; int i=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            i=axpy_i4f_avx512(w+(base>>1),cs,acc+base,glen);
+#endif
+            for(; i+1<glen; i+=2){ uint8_t b=w[(base+i)>>1]; acc[base+i]+=cs*((int)(b&0xF)-8); acc[base+i+1]+=cs*((int)(b>>4)-8); }
+            if(glen&1){ uint8_t b=w[(base+glen-1)>>1]; acc[base+glen-1]+=cs*((int)(b&0xF)-8); }
+        } return; }
     const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
     for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc[i]+=c*((int)((b>>((i&3)*2))&3)-2); }
 }
@@ -2908,9 +2930,12 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
             if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
         else if(t->fmt==4){ int gs=t->gs>0?t->gs:1, ng=(I+gs-1)/gs; const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
             const float *scl=t->s+(int64_t)row*ng; double aa=0;
-            for(int g=0; g*gs<I; g++){ int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base; float acc=0;
-                for(int i=base;i+1<base+glen;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
-                if(glen&1){ int i=base+glen-1; uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]; }
+            for(int g=0; g*gs<I; g++){ int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base; float acc=0; int i=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+                acc=dot_i4f_avx512(w+(base>>1),x+base,glen); i=glen&~31;
+#endif
+                for(; i+1<glen; i+=2){ uint8_t b=w[(base+i)>>1]; acc+=((int)(b&0xF)-8)*x[base+i]+((int)(b>>4)-8)*x[base+i+1]; }
+                if(glen&1){ int i2=base+glen-1; uint8_t b=w[i2>>1]; acc+=((int)(b&0xF)-8)*x[i2]; }
                 aa+=(double)(acc*scl[g]); } a=aa; }
         else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
