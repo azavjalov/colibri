@@ -183,3 +183,57 @@ far below socket peak; 90→129 cores *regresses* 4.02→3.54 tok/s at S=1):
   prefetch depth 1→N / overlap 2+ expert streams for more memory-level parallelism.
 - **(big/speculative)** real continuous/cross-request batching to raise diverse
   rows-per-expert (needs the `S<=64` cap lifted; large cross-cutting serving change).
+
+---
+
+## Results — what was implemented and what was rejected
+
+Two experiments were run to conclusion off the back of the research above.
+
+### LANDED — Direction 2, Option B: requant o_proj + kv_b fmt=4 → int8 (`AMX_REQUANT`, default ON)
+
+Commit `d5b6e2f` (`GLM-5.2: requant o_proj/kv_b fmt=4->int8 to reach AMX tile path`).
+
+At load time, both the MLA output-projection (`o_proj`) and `kv_b` weights are dequantized
+from fmt=4 grouped-int4 back to fp32 and re-quantized to fmt=1 int8 (per-row scale) via the
+existing `quantize_rows()`. This is a **load-time plumbing change only — no new kernel** —
+reusing the fmt=1 AMX path that already exists. Gated by `AMX_REQUANT` (default ON;
+`AMX_REQUANT=0` disables). A one-line `[amx-requant] requantized 156 MLA proj tensors …`
+summary prints at model init (156 = 78 layers × {o_proj, kv_b}).
+
+Two independently-confirmed mechanisms:
+- **o_proj genuinely reaches AMX** — with fmt=1 it now passes `amx_prepack_q8` +
+  `matmul_q_idot_mm_amx` (confirmed AMX-packed on 78/78 layers). ~2.7–2.9× on the o_proj op.
+- **kv_b's absorb-path dequant gets cheaper** — per-row int8 vs per-128-group int4. Note
+  kv_b is **not** AMX (in batch decode `kvs!=NULL` forces `absorb=true`, so kv_b runs
+  `qt_addrow`/`qt_matvec_rows` and never enters `matmul_qt_ex`); the win is purely
+  simpler-per-element dequant. (A dedicated fmt=4 AMX kernel — "Option A" — would therefore
+  gain nothing on kv_b.)
+
+**Throughput:** ~**1.3–1.4× aggregate** decode at N=16/N=32 (conservative, cross-validated;
+the raw 1.9× seen at N=16 was noise-inflated by unrelated buckets — the clean N=32 number is
+1.35× with o_proj+kv_b accounting for 94% of the step-time reduction). **S=1 unaffected**
+(stays VNNI — AMX only gates in at S≥16).
+
+**Quality (SCORE gate, ABSORB=1, 36 probes, on the landed committed build):**
+`0/36 argmax/greedy flips`, nat/tok delta **+0.0033** (baseline 2.7941 → 2.7974). ~35× under
+the +0.117 nat/tok that disqualified q_a/q_b/kv_a from int8 activations — those attention
+input projections are deliberately **left as fmt=4** (their loss comes from int8 *activation*
+quantization, which requant does not fix).
+
+**Cost:** resident +3.94 GB (+1.07%, 377316→381348 MB); model load +11.5 s one-time
+(14.0→25.5 s). Both trivial / off the decode critical path.
+
+### REJECTED — Direction 3 (safe lever): `PILOT_CACHE_XE` expert-weight prefetch
+
+Clean negative; **left at its default (OFF), nothing landed.** Triangulated across N=1, N=16,
+and a patched lookahead-depth sweep (1/3/7):
+- N=1: OFF 3.996 vs ON 3.874 tok/s (−3.1%, inside noise). N=16: 16.230 vs 16.174 (−0.3%).
+- Depth sweep showed **no dose-response** (depths 1/3/7 statistically indistinguishable at
+  N=1; depth 7 was −1.8% *worse* at N=16) — so it is not a "needs a longer shadow window"
+  problem.
+- Consistent with the bandwidth diagnosis: the regime runs at ~5% of peak DRAM bandwidth, so
+  weight-fill latency is not contention-bound, and seeding ~0.1% of an expert's block adds
+  nothing the HW L2 streamer wasn't already getting from the matmul's natural access pattern.
+  Root-causing the MoE bottleneck further needs stall-cycle profiling of the kernel itself,
+  not more prefetch tuning.
