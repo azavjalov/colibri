@@ -1887,6 +1887,67 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
 #endif
     return t;
 }
+/* ===== AMX int8 requant of MLA output/value projections =====
+ * Load-time requantize a resident fmt=4 (grouped int4, gs=128) weight to
+ * fmt=1 (int8, one scale per OUTPUT ROW) so it reaches the fmt=1 AMX tile
+ * path in matmul_qt_ex (amx_prepack_q8 + matmul_q_idot_mm_amx) at
+ * S>=g_amx_smin, instead of the non-AMX fmt=4 early-return
+ * (matmul_i4_grouped). Applied to o_proj and kv_b only (see call sites);
+ * q_a/q_b/kv_a are deliberately excluded -- IDOT int8 activation quant
+ * costs them ~+0.117 nat/tok (measured; see matmul_qt_ex's comment),
+ * whereas o_proj/kv_b requant is quality-neutral (0/36 argmax flips,
+ * +0.006 nat/tok on the score probes).
+ *
+ * At batch (S>=16) o_proj then runs the AMX int8 tile GEMM (~1.3-1.4x
+ * aggregate decode throughput at N=16/N=32); kv_b's batch-decode absorb
+ * path never enters matmul_qt_ex but still gets cheaper per-row int8
+ * dequant vs per-128-group int4. S=1 decode is unaffected (stays VNNI).
+ *
+ * Math: dequant fmt=4 -> fp32 using the SAME nibble/scale convention as
+ * matmul_i4_grouped (value = (nibble-8)*scl[g], scl indexed [O][ng],
+ * ng=ceil(I/gs)); re-quantize fp32 -> int8 with the SAME quantize_rows()
+ * every native fmt=1 tensor uses. amx_eligible is already 1 (set by
+ * qt_load) and amx_packed still its fresh 0 -- left untouched, so the
+ * first S>=g_amx_smin call drives the AMX gate with no extra plumbing.
+ * Frees the old q4/scale buffers (qalloc()==malloc() on this CPU-only
+ * build). Costs ~+4GB resident and ~+11s one-time load.
+ *
+ * ON by default; set AMX_REQUANT=0 to disable (revert to fmt=4). */
+static int g_amx_requant=-1;
+static long g_amx_requant_n=0;
+static void requant_fmt4_to_int8(QT *w){
+    if(g_amx_requant<0){
+        const char *e=getenv("AMX_REQUANT");
+        g_amx_requant = e ? atoi(e) : 1;   /* default ON */
+    }
+    if(!g_amx_requant) return;
+    if(w->fmt!=4 || !w->q4 || !w->s) return;
+    int O=w->O, I=w->I, gs=w->gs>0?w->gs:1, ng=(I+gs-1)/gs, rb=(I+1)/2;
+    float *tmp=falloc((int64_t)O*I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *row=w->q4+(int64_t)o*rb;
+        const float *scl=w->s+(int64_t)o*ng;
+        float *dst=tmp+(int64_t)o*I;
+        for(int g=0; g*gs<I; g++){
+            int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+            float sc=scl[g]; int i=base;
+            for(; i+1<base+glen; i+=2){
+                uint8_t b=row[i>>1];
+                dst[i]  =(float)((int)(b&0xF)-8)*sc;
+                dst[i+1]=(float)((int)(b>>4)-8)*sc;
+            }
+            if(i<base+glen){ uint8_t b=row[i>>1]; dst[i]=(float)((int)(b&0xF)-8)*sc; }
+        }
+    }
+    int8_t *newq8=(int8_t*)qalloc((size_t)O*I);
+    float  *newsc=qsalloc(O);
+    quantize_rows(tmp, newq8, newsc, O, I, 8);
+    free(tmp);
+    free(w->q4); free(w->s);
+    w->q4=NULL; w->fmt=1; w->gs=0; w->q8=newq8; w->s=newsc;
+    g_amx_requant_n++;
+}
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0){fprintf(stderr,"missing %s\n",name);exit(1);}
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
@@ -2093,7 +2154,9 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         l->kv_a  = qt_load(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
         l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
+        requant_fmt4_to_int8(&l->kv_b);
         l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+        requant_fmt4_to_int8(&l->o);
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
         qt_cuda_colocate(&l->q_a,&l->kv_b);   /* PIPE: intera catena attention sulla */
@@ -2154,7 +2217,9 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
             l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"));
             l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
+            requant_fmt4_to_int8(&l->kv_b);
             l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+            requant_fmt4_to_int8(&l->o);
             l->sparse=1;
             l->router=ld(m,PM("mlp.gate.weight"));
             l->router_bias=ld(m,PM("mlp.gate.e_score_correction_bias"));
@@ -2291,6 +2356,10 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         fprintf(stderr,"[resident] wired %d rows, %.1f GB of experts, in %.1fs\n",
                 nrows, wired_bytes/1e9, now_s()-t0);
     }
+    if(g_amx_requant_n>0)
+        fprintf(stderr,"[amx-requant] requantized %ld MLA proj tensors (o_proj/kv_b) "
+                "fmt4->int8 for the AMX tile path (AMX_REQUANT=0 to disable)\n",
+                g_amx_requant_n);
 }
 
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
