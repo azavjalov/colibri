@@ -88,19 +88,60 @@ lm_head        0.35s
 - DRAM bandwidth during decode ≈ 43–65 GB/s vs a ~844 GB/s socket ceiling (~5–8%):
   **not memory-bandwidth-bound** at any batch size.
 
-## Throughput (this recipe: single node, 40 cores, MXFP4, RESIDENT=1)
+## Throughput (single node, 40 cores, MXFP4, RESIDENT=1)
 
 | Config | tok/s aggregate | tok/s per stream |
 |---|---|---|
 | Single-stream (N=1) | 3.02 | 3.02 |
 | Batched (N=16)      | 8.85 | 0.55 |
 
+The numbers above are the single-node baseline. Spreading across all three SNC nodes
+(next section) roughly doubles N=16 throughput.
+
+## Core allocation — use the whole socket (full-pool span)
+
+The baseline recipe above pins the runtime to one SNC node (`--cpunodebind=0`,
+`OMP_NUM_THREADS=40`), leaving ~90 of the box's 129 usable physical cores idle. The
+earlier bandwidth measurement showed decode used only ~5–8% of the ~844 GB/s socket
+ceiling at 40 cores, i.e. large headroom. Spreading the resident experts across all
+three SNC nodes (`NUMA_PARTITION=1`, `expert_node = eid % 3`) and running **one OMP
+pool across all three nodes' cores** (`numactl --interleave=all`,
+`OMP_NUM_THREADS=120`) consumes that headroom:
+
+| Config | cores / threads | N=1 tok/s | N=16 tok/s (agg) |
+|---|---|---|---|
+| Baseline (1 node) | node0, 40T, `--cpunodebind=0` | 3.17 | 8.98 |
+| **Full-pool span** | all 3 nodes, 120T, `--interleave=all`, `NUMA_COMPUTE=0` | **4.16 (+31%)** | **16.47 (+84%)** |
+| NUMA 3-pass | all nodes, `NUMA_COMPUTE=1` | 3.35 | pathological (killed) |
+
+Tuned recipe (full-pool span — the recommended default):
+
+```
+NUMA_PARTITION=1 NUMA_COMPUTE=0 OMP_NUM_THREADS=120 \
+  OMP_PROC_BIND=close OMP_PLACES=cores \
+  numactl --interleave=all ./glm 256
+```
+
+This is a **runtime/env change, not a code change**.
+
+### Thread-count tuning
+
+- **Sweet spot ≈ 108–120 physical threads**, and the curve is flat across it:
+  N=16 gave 15.69 (102T), 16.57 (108T), 16.47 (120T), 15.97 (126T) tok/s — 108 and
+  120 are within run-to-run noise (~0.6%). Default kept at 120.
+- **Do not exceed ~120**: using all 129 physical cores starves the OS-reserved cores
+  and regresses (N=1 3.54 at 129T vs ~4.1 at ~108T).
+- **Do not use hyperthreading**: `OMP_PLACES=threads` with 240 logical threads gave
+  N=1 2.88 tok/s (−30%). Stick to physical cores (`OMP_PLACES=cores`).
+- N=1 is latency-bound and noisy (±0.3 tok/s), so the thread sweet spot is best read
+  from the throughput-bound N=16 sweep.
+
 ## Remaining levers
 
-- **o-proj** — now the largest attention sub-phase.
+- **o-proj** — the largest attention sub-phase after the fmt=4 vectorization.
 - **expert-matmul** — already AMX; hard to beat.
-- **More cores** — the box has 128 physical / 256 logical cores across 3 SNC nodes,
-  but the current NUMA compute design runs node passes sequentially (one node's ~40
-  cores active at a time), so it cannot exploit the other nodes concurrently. A
-  genuinely concurrent design would need per-node partial output buffers + a final
-  reduce.
+- **NUMA_COMPUTE 3-pass** — confirmed a dead end: it runs each node's cores
+  sequentially (to keep the shared `out[]` accumulation race-free) plus a per-pass
+  affinity-rebind tax, so it cannot exploit multiple nodes concurrently and is far
+  slower than the full-pool span. A genuinely concurrent multi-node design would need
+  per-node partial output buffers + a final reduce; not pursued.
