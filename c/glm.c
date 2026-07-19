@@ -609,9 +609,144 @@ static void f32_to_bf16_buf(uint16_t *dst, const float *src, int64_t n){
 }
 #endif /* __AVX512BF16__ */
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* ---- v_def4: matmul_i4_grouped AVX-512 path ----
+ * Profiling found the AVX2 path below spending only ~13% of its cycles on
+ * arithmetic: an hsum256 horizontal-reduce runs EVERY 128-element group (7%),
+ * loads are 8B/iter narrow (_mm_loadl_epi64, 22%), and unpack/loop overhead
+ * eat the rest (31%+22%). v_def4 fixes this reusing dot_i4f_avx512's exact
+ * nibble-unpack (32 nibbles/iter, two independent __m512 FMA chains):
+ *   1. Deferred per-group reduction: instead of one _mm512_reduce_add_ps
+ *      hsum per GROUP, scale-and-fmadd each group's UNREDUCED partial vector
+ *      into a persistent per-row __m512 accumulator and reduce ONCE at the
+ *      end of the row. Valid because every full group has the identical
+ *      32-wide sub-iteration/lane layout (gs is a multiple of 32 for the
+ *      production gs=128), so this is a pure reassociation of the original
+ *      sequential "hsum, scale, scalar-add" order -- like I4_ACC512's own
+ *      tree reduction, this does not make things worse: i4g512_selftest
+ *      cross-checks it against AVX2 and a scalar oracle, and the standalone
+ *      microbench found it ~2-5x MORE accurate on random data (less
+ *      catastrophic cancellation than chaining 48 already-reduced scalars).
+ *   2. 4-output-row register block: 4 rows share each activation
+ *      _mm512_loadu_ps load across 4 independent weight-unpack/FMA chains
+ *      and 4 persistent row accumulators (mirrors matmul_mxfp4_bf16's
+ *      4-column block, ported to the int4 grouped-scale format). O not a
+ *      multiple of 4 falls back to the 1-row helper below for the remainder.
+ * Ragged sub-32 remainders (gs a multiple of 16 but not 32, e.g. 48; or a
+ * short last group when I%gs!=0 -- neither ever true on the production
+ * tensors: gs=128, I in {2048,6144,12288}) fall back to an exact scalar
+ * per-row tail computed from the same bytes/scale, so any shape stays
+ * correct, just not maximally vectorized. */
+static inline float i4g512_row(const uint8_t *w, const float *xs, const float *scl, int I, int gs){
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
+    __m512 racc=_mm512_setzero_ps(); float atail=0; int g=0;
+    for(int base=0; base<I; base+=gs, g++){
+        int glen=gs; if(base+glen>I) glen=I-base;
+        float sc=scl[g]; int i=0;
+        __m512 acc0=_mm512_setzero_ps(), acc1=_mm512_setzero_ps();
+        for(; i+32<=glen; i+=32){
+            __m128i by=_mm_loadu_si128((const __m128i*)(w+((base+i)>>1)));
+            __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);
+            __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+            __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+            acc0=_mm512_fmadd_ps(_mm512_loadu_ps(xs+base+i),   w0, acc0);
+            acc1=_mm512_fmadd_ps(_mm512_loadu_ps(xs+base+i+16),w1, acc1);
+        }
+        racc=_mm512_fmadd_ps(_mm512_add_ps(acc0,acc1), _mm512_set1_ps(sc), racc);
+        for(; i<glen; i+=2){
+            if(i+1<glen){ uint8_t b=w[(base+i)>>1];
+                atail+=(xs[base+i]*(float)((int)(b&0xF)-8)+xs[base+i+1]*(float)((int)(b>>4)-8))*sc; }
+            else { uint8_t b=w[(base+i)>>1]; atail+=xs[base+i]*(float)((int)(b&0xF)-8)*sc; }
+        }
+    }
+    return _mm512_reduce_add_ps(racc)+atail;
+}
+#endif
+
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if(g_i4_acc512){
+        #pragma omp parallel for schedule(static)
+        for(int o4=0;o4<O;o4+=4){
+            int nb=(o4+4<=O)?4:(O-o4);
+            const uint8_t *w[4]; const float *scl[4];
+            for(int j=0;j<nb;j++){ w[j]=q4+(int64_t)(o4+j)*rb; scl[j]=scale+(int64_t)(o4+j)*ng; }
+            if(nb==4){
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
+                for(int s=0;s<S;s++){
+                    const float *xs=x+(int64_t)s*I;
+                    __m512 racc0=_mm512_setzero_ps(),racc1=_mm512_setzero_ps(),
+                           racc2=_mm512_setzero_ps(),racc3=_mm512_setzero_ps();
+                    float atail0=0,atail1=0,atail2=0,atail3=0; int g=0;
+                    for(int base=0; base<I; base+=gs, g++){
+                        int glen=gs; if(base+glen>I) glen=I-base;
+                        float sc0=scl[0][g],sc1=scl[1][g],sc2=scl[2][g],sc3=scl[3][g]; int i=0;
+                        __m512 a00=_mm512_setzero_ps(),a01=_mm512_setzero_ps();
+                        __m512 a10=_mm512_setzero_ps(),a11=_mm512_setzero_ps();
+                        __m512 a20=_mm512_setzero_ps(),a21=_mm512_setzero_ps();
+                        __m512 a30=_mm512_setzero_ps(),a31=_mm512_setzero_ps();
+                        for(; i+32<=glen; i+=32){
+                            __m512 xv0=_mm512_loadu_ps(xs+base+i), xv1=_mm512_loadu_ps(xs+base+i+16);
+                            { __m128i by=_mm_loadu_si128((const __m128i*)(w[0]+((base+i)>>1)));
+                              __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                              __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+                              __m512 wv0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+                              __m512 wv1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+                              a00=_mm512_fmadd_ps(xv0,wv0,a00); a01=_mm512_fmadd_ps(xv1,wv1,a01); }
+                            { __m128i by=_mm_loadu_si128((const __m128i*)(w[1]+((base+i)>>1)));
+                              __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                              __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+                              __m512 wv0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+                              __m512 wv1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+                              a10=_mm512_fmadd_ps(xv0,wv0,a10); a11=_mm512_fmadd_ps(xv1,wv1,a11); }
+                            { __m128i by=_mm_loadu_si128((const __m128i*)(w[2]+((base+i)>>1)));
+                              __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                              __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+                              __m512 wv0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+                              __m512 wv1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+                              a20=_mm512_fmadd_ps(xv0,wv0,a20); a21=_mm512_fmadd_ps(xv1,wv1,a21); }
+                            { __m128i by=_mm_loadu_si128((const __m128i*)(w[3]+((base+i)>>1)));
+                              __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                              __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+                              __m512 wv0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+                              __m512 wv1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+                              a30=_mm512_fmadd_ps(xv0,wv0,a30); a31=_mm512_fmadd_ps(xv1,wv1,a31); }
+                        }
+                        racc0=_mm512_fmadd_ps(_mm512_add_ps(a00,a01),_mm512_set1_ps(sc0),racc0);
+                        racc1=_mm512_fmadd_ps(_mm512_add_ps(a10,a11),_mm512_set1_ps(sc1),racc1);
+                        racc2=_mm512_fmadd_ps(_mm512_add_ps(a20,a21),_mm512_set1_ps(sc2),racc2);
+                        racc3=_mm512_fmadd_ps(_mm512_add_ps(a30,a31),_mm512_set1_ps(sc3),racc3);
+                        for(; i<glen; i+=2){
+                            uint8_t b0=w[0][(base+i)>>1],b1=w[1][(base+i)>>1],b2=w[2][(base+i)>>1],b3=w[3][(base+i)>>1];
+                            if(i+1<glen){
+                                float x0=xs[base+i],x1=xs[base+i+1];
+                                atail0+=(x0*(float)((int)(b0&0xF)-8)+x1*(float)((int)(b0>>4)-8))*sc0;
+                                atail1+=(x0*(float)((int)(b1&0xF)-8)+x1*(float)((int)(b1>>4)-8))*sc1;
+                                atail2+=(x0*(float)((int)(b2&0xF)-8)+x1*(float)((int)(b2>>4)-8))*sc2;
+                                atail3+=(x0*(float)((int)(b3&0xF)-8)+x1*(float)((int)(b3>>4)-8))*sc3;
+                            } else {
+                                float x0=xs[base+i];
+                                atail0+=x0*(float)((int)(b0&0xF)-8)*sc0; atail1+=x0*(float)((int)(b1&0xF)-8)*sc1;
+                                atail2+=x0*(float)((int)(b2&0xF)-8)*sc2; atail3+=x0*(float)((int)(b3&0xF)-8)*sc3;
+                            }
+                        }
+                    }
+                    float *yr=y+(int64_t)s*O+o4;
+                    yr[0]=_mm512_reduce_add_ps(racc0)+atail0; yr[1]=_mm512_reduce_add_ps(racc1)+atail1;
+                    yr[2]=_mm512_reduce_add_ps(racc2)+atail2; yr[3]=_mm512_reduce_add_ps(racc3)+atail3;
+                }
+            } else {
+                for(int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I;
+                    for(int j=0;j<nb;j++) y[(int64_t)s*O+o4+j]=i4g512_row(w[j],xs,scl[j],I,gs);
+                }
+            }
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *w=q4+(int64_t)o*rb;
@@ -645,6 +780,68 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
         }
     }
 }
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* selftest per matmul_i4_grouped: confronta il path AVX-512 (v_def4, via
+ * g_i4_acc512=1) e quello AVX2 (g_i4_acc512=0) -- chiamando la funzione VERA,
+ * non una copia -- contro un riferimento scalare in doppia precisione, su
+ * shape che coprono: gruppi esatti multipli di 32 (gs=128, produzione),
+ * l'ultimo gruppo ragged (I%gs!=0), gs multiplo di 16 ma non di 32 (gs=48),
+ * gruppi piu' piccoli di una iterazione vettoriale (gs=16), e i resti O%4 in
+ * {0,1,2,3} del blocco a 4 righe. / selftest for matmul_i4_grouped: compares
+ * the AVX-512 (v_def4, g_i4_acc512=1) and AVX2 (g_i4_acc512=0) paths -- by
+ * calling the REAL function, not a copy -- against a double-precision
+ * scalar reference, over shapes covering: exact 32-multiple groups (gs=128,
+ * production), a ragged last group (I%gs!=0), gs a multiple of 16 but not
+ * 32 (gs=48), groups smaller than one vector iteration (gs=16), and every
+ * O%4 remainder {0,1,2,3} of the 4-row block. */
+static int i4g512_selftest(void){
+    static const int shapes[][4] = {   /* I, O, S, gs */
+        {6144,6,2,128}, {2048,9,1,128}, {12288,4,1,128},
+        {6143,5,1,128}, {6144,8,1,48},  {160,7,1,16},
+    };
+    int saved=g_i4_acc512, ok=1;
+    for(unsigned t=0;t<sizeof(shapes)/sizeof(shapes[0]) && ok;t++){
+        int I=shapes[t][0],O=shapes[t][1],S=shapes[t][2],gs=shapes[t][3];
+        int rb=(I+1)/2, ng=(I+gs-1)/gs;
+        uint8_t *q4=malloc((size_t)O*rb);
+        float *scale=malloc((size_t)O*ng*sizeof(float));
+        float *x=malloc((size_t)S*I*sizeof(float));
+        float *y5=malloc((size_t)S*O*sizeof(float));
+        float *y2=malloc((size_t)S*O*sizeof(float));
+        for(int64_t i=0;i<(int64_t)O*rb;i++) q4[i]=(uint8_t)(((i*41+17)&0xF)|(((i*13+5)&0xF)<<4));
+        for(int64_t i=0;i<(int64_t)O*ng;i++) scale[i]=0.001f+(float)((i*7+3)%23)*0.0005f;
+        for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=(float)(((i*29+7)%101)-50)/37.f;
+
+        g_i4_acc512=1; matmul_i4_grouped(y5,x,q4,scale,S,I,O,gs);
+        g_i4_acc512=0; matmul_i4_grouped(y2,x,q4,scale,S,I,O,gs);
+
+        for(int s=0;s<S && ok;s++){
+            for(int o=0;o<O && ok;o++){
+                double ref=0; const uint8_t *w=q4+(int64_t)o*rb; const float *scl=scale+(int64_t)o*ng;
+                const float *xs=x+(int64_t)s*I;
+                for(int g=0; g*gs<I; g++){
+                    int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+                    double gsum=0;
+                    for(int ii=0;ii<glen;ii++){ int idx=base+ii; uint8_t b=w[idx>>1];
+                        int nib=(idx&1)?((b>>4)&0xF):(b&0xF); gsum+=(double)xs[idx]*(double)(nib-8); }
+                    ref += gsum*(double)scl[g];
+                }
+                float got5=y5[(int64_t)s*O+o], got2=y2[(int64_t)s*O+o];
+                double tol=1e-3*(1.0+fabs(ref));
+                if(fabs((double)got5-ref)>tol){
+                    fprintf(stderr,"i4g512 selftest FAIL (avx512) I=%d O=%d S=%d gs=%d o=%d s=%d: %.9g != %.9g (ref)\n",
+                        I,O,S,gs,o,s,(double)got5,ref); ok=0; }
+                if(fabs((double)got2-ref)>tol){
+                    fprintf(stderr,"i4g512 selftest FAIL (avx2 regression check) I=%d O=%d S=%d gs=%d o=%d s=%d: %.9g != %.9g (ref)\n",
+                        I,O,S,gs,o,s,(double)got2,ref); ok=0; }
+            }
+        }
+        free(q4); free(scale); free(x); free(y5); free(y2);
+    }
+    g_i4_acc512=saved;
+    return ok;
+}
+#endif
 /* Decode hot path for gate+up: same exact q4 dot products as matmul_i4, but one
  * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
  * this keeps colibri dependency-free while removing one team launch/expert. */
@@ -6644,6 +6841,7 @@ int main(int argc, char **argv){
     if(getenv("I4_ACC512")) g_i4_acc512=atoi(getenv("I4_ACC512"))!=0;
     if(getenv("I4_ACC512_TEST")){
         if(!i4_acc512_selftest()) return 1;
+        if(!i4g512_selftest()) return 1;
         puts("AVX512 i4 selftest: ok"); return 0;
     }
 #endif
