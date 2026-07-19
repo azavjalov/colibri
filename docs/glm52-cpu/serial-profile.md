@@ -382,3 +382,50 @@ shared/dense requant specifically (the real unknown); (3) perf A/B via INSTR —
 existing timer cleanly isolates the shared expert from the routed fmt=5 experts** (the
 `t_moe_kernel` "fmt=4" comment at ~:3995 is stale), so a clean shared-expert A/B likely needs a
 small dedicated timer added, mirroring the existing `t_aproj`/`t_aout` pattern.
+
+---
+
+### REJECTED — MoE MXFP4 unpack/scale codegen from SGLang (`MXFP4_LUT`)
+
+Clean negative; **left at its default (OFF), reverted — nothing landed.** This ported the
+unmerged Intel SGLang `intel_dev` MXFP4→bf16 codegen (`cvt_mxfp4_e2m1_bf16_intrinsic_lut`,
+`sgl-kernel/csrc/cpu/vec.h`) into `matmul_mxfp4_bf16` / `matmul_mxfp4`, replacing two hot
+sequences at once:
+- **Unpack:** one `_mm512_permutexvar_epi16` against a 16-entry bf16 LUT, instead of glmrt's
+  ~13-op 128-bit SSE shuffle chain (`_mxfp4_to_bf16_32`, the 22% "nibble→bf16" bucket).
+- **Scale:** fold the E8M0 group scale into the bf16 weight as an exponent add
+  (`_mm512_add_epi16(w, (int16_t)(e8m0−127)<<7)`), so the `_dpbf16_ps` output is already
+  scaled — dropping glmrt's per-group `_mm512_set1_ps(scale)` + `vfmadd231ps` (the 15.7%
+  scale-FMA bucket) and collapsing to one `reduce_add` per output (same win class as v_def4).
+
+**Compute win is real; wall-clock win is not.** Standalone microbench (single thread, real
+expert shapes I=6144→2048 and 2048→6144, gs=32, vs an f64 MXFP4 oracle): **~1.5× GF/s**
+(43.3 vs ~29 gate/up; 42.7 vs 27.8 down) at **accuracy parity** (LUT rel-err 1.12e-7 vs
+glmrt 1.07e-7 — both at the bf16 noise floor; the two kernels agree to 7.75e-8). Bit-safety of
+the exponent-add scaling was verified across E8M0 exponents 120..134, both signs (the E8M0
+scale is exactly 2^(b−127), a pure power of two, so the fold is mathematically exact absent
+bf16 overflow/denormal).
+
+But in-model the gain does not convert:
+- **N=1 (120T):** expert-matmul **14.051 vs 14.052 s** — flat.
+- **N=16 (120T):** 13.944 → 13.680 s (−1.9%, +1.2% tok/s) — single-sample, opposite tiny sign
+  from N=1, inside run-to-run variance; not a reproducible separation.
+- Same bandwidth diagnosis as `PILOT_CACHE_XE`: the routed-expert MXFP4 path is
+  DRAM-bandwidth-bound (~42 GB/s, ~5% of peak; N=16 expert-matmul ≈ N=1 because the replay
+  reads the same 8 experts/layer regardless of batch), so a compute-side unpack/scale
+  reduction has no wall-clock headroom to recover.
+
+**And it carries a small but real quality cost.** SCORE gate (36 probes / 562 tok, 40T
+deterministic): **0/36 argmax flips**, but **+0.0104 nat/tok** perplexity. A baseline-vs-baseline
+control (LUT=0 run twice) came back at **exactly 0.000000** nat/tok delta and identical total
+lp to the last digit — the harness is fully deterministic at this config, so the +0.0104 is a
+**genuine** shift, not reassociation noise. The exponent-add scaling is exact for the scale
+itself, but the permutexvar bf16 LUT rounds the E2M1 code values slightly differently than
+glmrt's shuffle-LUT byte pair, which is the likely source.
+
+**Verdict:** two independent disqualifiers — no reproducible wall-clock benefit (bandwidth
+wall) **and** a real +0.0104 nat/tok regression paid for nothing. Reverted; the SGLang
+CPU MXFP4 codegen is AOT-compiled C++ templates (no runtime JIT), and its cleverness is
+purely compute-side, which this workload cannot cash in. Recorded so the idea is not re-tried
+without first attacking the bandwidth bound (weight footprint / prefetch-into-the-matmul /
+NUMA placement), not the unpack instruction count.
