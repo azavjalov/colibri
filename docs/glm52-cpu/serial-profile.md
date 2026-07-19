@@ -429,3 +429,41 @@ CPU MXFP4 codegen is AOT-compiled C++ templates (no runtime JIT), and its clever
 purely compute-side, which this workload cannot cash in. Recorded so the idea is not re-tried
 without first attacking the bandwidth bound (weight footprint / prefetch-into-the-matmul /
 NUMA placement), not the unpack instruction count.
+
+---
+
+## B70 (Intel Arc Pro, Battlemage) XPU offload — CLEAN NEGATIVE (shelved)
+
+Task 3: research an optional `#ifdef COLI_XPU` GPU-offload backend for the 2× Arc Pro B70
+(64 GB VRAM total) in aibox101b, mirroring colibri's `COLI_CUDA` seam. Full write-up:
+`docs/glm52-cpu/b70-xpu-offload-plan.md`. Outcome: **SHELVE — no backend justified.**
+
+**Infra proven (kept for any future experiment):** both B70s operational (xe driver, 2×32 GB);
+one-line libumf `LD_LIBRARY_PATH` fix enables SYCL/L0 enumeration. Trivial GEMM PASSes on B70 via
+BOTH SYCL (icpx, JIT — AOT `-device bmg` hangs) and Level-Zero (SPIR-V via `ocloc`, needs explicit
+`zeCommandListAppendBarrier` between H2D→kernel→D2H). **Chose Level-Zero** if ever pursued: 7 vs 16
+`ldd` libs, zero oneAPI runtime dep, works without setvars — matches glmrt-lean ethos.
+
+**Why shelved (three converging measurements):**
+1. **Routing is near-uniform, model overflows VRAM.** Per-expert MXFP4 = 20.05 MB; only ~2,792
+   fit in 56 GB usable of 19,200 total. N=1 STATS replay: 99.4% of experts hit in 80 tokens, mean
+   142.9 vs 142.0 uniform. Top 56 GB hottest carry only 52.7% of selections → static hot-set caps
+   at ~53% hit; the other ~47% still bottleneck host DRAM (and per-token latency gates on the
+   slowest path).
+2. **Batching doesn't concentrate access.** Batch-union reuse = 1.27 rows/expert at N=16 (E=256,
+   K=8 combinatorics; matches the recorded MoE-AMX figure). Wall-clock cross-check: expert-matmul
+   −8.9% only. Weight bandwidth does not amortize with batch.
+3. **Ceiling is tiny + glmrt has no overlap pipeline.** The always-hit VRAM-fitting set (shared
+   expert ×75 + dense layers 0-2) = 1.87 GB/token = **only 13.4%** of MoE-weight bytes → sequential
+   offload ceiling ~9.8% of decode, ≤~10% even with overlap (routed = 86.6% dominates).
+
+**Reconciliation with the production NVIDIA+AMX hybrid** (which DOES boost a VRAM-overflow model):
+its win is **disk-elimination (already banked here via RESIDENT=1) + CPU/GPU OVERLAP on a
+deliberately-low-active-param model** (DeepSeek-V4-Flash, 13B active) — NOT GPU expert placement
+(its own tuning record: `--kt-num-gpu-experts` sweep = "wash"; lesson = "increase overlap, don't
+move experts to GPU"). colibri's `COLI_CUDA` path is strictly SEQUENTIAL (every call
+`cudaStreamSynchronize`s; pthread overlap was tried on the 6×5090 rig and abandoned), and its
+CUDA routed-expert tier is inert for native MXFP4 (`row_bytes()` returns 0 for fmt=5). GLM-5.2
+(37B active) is 3× the CPU feed of V4-Flash. So: to capture a ≤10% bandwidth-bound ceiling on B70
+we'd first have to build an async overlap pipeline glmrt lacks — not worth it. Same root cause as
+MXFP4-LUT / MoE-AMX: perf is gated by memory bandwidth, not by where compute runs.

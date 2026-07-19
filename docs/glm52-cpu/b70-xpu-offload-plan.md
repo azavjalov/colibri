@@ -134,6 +134,135 @@ Settled fact (serial-profile.md): **the MoE MXFP4 decode path is DRAM-bandwidth-
 - **Validation gate is unchanged and HARD (user rule): wall-clock decode tok/s at N=1 AND N=16.**
   A microbench/compute win alone is meaningless. Plus the SCORE gate (0 argmax flips) for quality.
 
+### 4a. EXPERT HIT-FREQUENCY MEASUREMENT (run this session — STRATEGY-CHANGING RESULT)
+
+Measured with the existing built-in instrumentation (NO patch needed): the runtime already
+tracks `m->eusage[layer][expert]` and dumps `layer expert count` triples when `STATS=<file>`
+is set (glm.c:6420 `stats_dump_q`, called at end of run L7196; the HOT-STORE `EXPERT_BUDGET`
+loader at glm.c:6439 already consumes this same file to pick top experts by frequency — that IS
+the residency mechanism a backend would reuse).
+
+Run: deterministic REPLAY harness (`REPLAY=1 REF=ref_bench.json REF_FORCE=1`, TEMP=0, 80 tokens,
+OMP=86) → `[STATS] 2,726,400 selections across 19,084 distinct experts`.
+
+**Per-expert MXFP4 VRAM footprint = 20.05 MB** (gate+up+down = 37,748,736 elems; nibbles/2 +
+E8M0 group bytes/32). → only **~3,191 experts fit in 64 GB** (2,792 in ~56 GB usable) out of
+**19,200 total** (75 MoE layers × 256).
+
+**The routing distribution is NEARLY FLAT — this undercuts the naive hot-set strategy:**
+- **99.4%** of all (layer,expert) slots were hit at least once in just 80 tokens.
+- **mean 142.9 selections/slot vs 142.0 uniform** — essentially uniform. top=2,225, median=70, min=1.
+- **Cumulative mass:** top 2,792 slots (56 GB) carry only **52.7%** of selections; top 3,191
+  (64 GB) = **56.5%**. Filling ALL VRAM with the hottest experts still misses ~44% of expert reads.
+- **Within-layer concentration weak:** top-8/256 experts = ~19.6% of a layer's traffic (min 14.4,
+  max 28.9); need top-64/256 to reach ~69%.
+
+**Implication (revises §4 strategy):** a STATIC hot-expert VRAM tier caps at ~53% expert-read
+hit-rate at 56 GB. Since decode is DRAM-bandwidth-bound and per-token latency is gated by the
+slowest path, offloading only ~53% of expert bandwidth to the GPU leaves the other ~47% still
+bottlenecked on host DRAM — at best a partial win, likely far below linear. **A static hot-set is
+NOT clearly worth it.** Re-frame the B70 role around one of:
+  1. **Full-model streaming through B70** — stage ALL experts' bandwidth through GPU GDDR (needs
+     the model resident in VRAM, which 64 GB can't hold → doesn't work for 375 GB). Rejected.
+  2. **Dynamic per-token residency / prefetch** — upload the top-8×75 = 600 selected experts for
+     the *next* token to VRAM ahead of compute. But that's 600×20 MB = 12 GB/token over PCIe
+     each step — PCIe 5.0 x16 ≈ 64 GB/s → ~190 ms/token just for transfer, worse than the current
+     ~260 ms/token CPU decode only if it overlaps poorly. Needs measurement, likely a loss.
+  3. **Compute-tier only for the SHARED expert + dense layers** (always-hit, small, fit easily in
+     VRAM) — bounded, cheap, but small share of total expert bandwidth.
+  4. **Batch/throughput regime (N≫1)** where expert reuse across the batch amortizes weight
+     bandwidth — the flat single-stream distribution matters less when many tokens share experts.
+
+**Caveats:** single 80-token replay on one prompt set (ref_bench.json); real multi-user serving
+may concentrate differently, and the N≫1 continuous-batching regime (DESIGN's actual deployment)
+was NOT measured here — expert reuse across a batch could restore concentration. **Before writing
+any backend, measure the batched (N=16) expert-reuse rate** — that is the regime that matters for
+the serving target, and it may reverse this negative.
+
+### 4b. BATCHED (N≫1) EXPERT-REUSE — the caveat is RESOLVED, and it's still a NEGATIVE
+
+The N=16 caveat above is now closed. Two independent confirmations that batching does NOT restore
+concentration enough to amortize expert-weight bandwidth:
+
+1. **Combinatorics of near-uniform top-8/256 routing** (batch-union distinct experts per
+   layer-step, E=256, K=8):
+   - N=1  → 8 requests → ~7.9 distinct, reuse **1.01** rows/expert
+   - N=16 → 128 requests → ~100.9 distinct, reuse **1.27** rows/expert  *(matches the
+     independently-recorded MoE-AMX finding: "~1.27 rows/expert at N=16, need ~512 to fill a tile")*
+   - N=32 → reuse 1.58 ; N=64 → 2.31 ; N=128 → 4.07. Reuse only becomes meaningful at batch
+     sizes far beyond the decode serving regime, and even then a loaded expert weight serves only
+     a handful of tokens.
+2. **Wall-clock** (REPLAY 80-tok, identical trace — note BATCH=16 is a NO-OP under REPLAY+REF_FORCE,
+   which replays one fixed single-stream trace, so this is a timing cross-check not a true 16-seq
+   batch): expert-matmul N=1 = 15.220s vs "N=16" = 13.861s (**−8.9% only**). Expert-weight traffic
+   does not amortize with batch because each distinct expert still gets streamed from DRAM ~once
+   per token that selects it.
+
+**CONCLUSION — recommend SHELVING the B70 hot-expert offload as a documented clean negative.**
+The workload is (a) DRAM-bandwidth-bound, (b) near-uniform in expert access (flat distribution,
+1.27× batch reuse at N=16), and (c) far too large for VRAM (375 GB ≫ 64 GB, static hot-set caps
+at ~53% hit). A per-op or hot-set GPU offload cannot help a bandwidth-bound, near-uniform-access,
+VRAM-overflowing workload — the ~47% of expert reads that miss VRAM still bottleneck host DRAM and
+gate per-token latency. This mirrors the MXFP4-LUT and MoE-AMX negatives: real perf is gated by
+memory bandwidth, not by where the compute runs.
+
+**What COULD still be worth a bounded follow-up (NOT the main backend):** offload only the
+always-hit, VRAM-fitting pieces — the **shared expert + the 3 dense layers (0-2)** — as a small
+`COLI_XPU` compute tier. These are hit every token, fit trivially in VRAM, and their bandwidth
+would come off GPU GDDR. But this is a small share of total expert bandwidth; measure the ceiling
+before investing. The Level-Zero infrastructure decision (§5a) stands if this narrow path is pursued.
+
+### 4c. RECONCILIATION vs the NVIDIA+AMX hybrid ("why does *that* boost a VRAM-overflow model?") + ceiling
+
+Prompted by the observation that our production NVIDIA-GPU + Granite-Rapids-CPU hybrid gets a
+strong boost on DeepSeek-V4-Flash despite the model not fitting VRAM. Investigated two systems:
+
+**(A) colibri's own `COLI_CUDA` path (glm.c) — measured on the 6×RTX 5090 rig, NOT this box:**
+- The ~48× (0.12→5.77 tok/s) win was **disk elimination / full residency**, not GPU compute
+  placement. That lever is **already banked on aibox101b** (RESIDENT=1, zero disk, 3.0-4.2 tok/s
+  N=1 with NO GPU).
+- GPU/CPU expert compute is **strictly sequential** — every `coli_cuda_*` ends in
+  `cudaStreamSynchronize` (backend_cuda.cu); the moe() loop computes cold experts on CPU inline,
+  then calls `coli_cuda_expert_group` only after. NO overlap. The 5090 experiment log explicitly
+  records "CPU/GPU expert overlap via pthreads: no stable gain."
+- Structural dead-end for OUR checkpoint: `row_bytes()` returns 0 for fmt=5, so
+  `coli_cuda_tensor_upload` **fails for native MXFP4 routed experts** — the CUDA routed-expert
+  tier is architecturally inert here; the 5090 numbers used a separately int4-quantized artifact.
+
+**(B) The production SGLang + KTransformers kt-kernel hybrid (DeepSeek-V4-Flash, RTX 6000 Blackwell
++ dual Xeon 6972P) — the "good boost" system:** ~30 tok/s single-stream, 120 @6, 219 @12. Its
+mechanism, from its own tuning record (perf_skills/sglang_deepseek_v4_flash_gpu_hybrid/SKILL.md):
+- **The win is CPU/GPU OVERLAP + disk-free residency, NOT putting experts on GPU.** Its own
+  DEAD-ENDS: `--kt-num-gpu-experts` sweep (32/48/56) = **"wash"**; explicit lesson #2 =
+  **"Increase CPU/GPU overlap, don't move experts to GPU."** The 40/256 GPU-resident experts exist
+  mainly to free the deferral pipeline, not for hit-rate. Its GPU util is ~88-91% via a **1-layer
+  expert-deferral pipeline** (GPU runs dense/attn/shared while CPU chews the deferred experts).
+- V4-Flash was CHOSEN for this role precisely because it has the **lowest active params (13B →
+  lowest CPU feed bytes/token)** and a shared expert — i.e. it minimizes the exact
+  DRAM-bandwidth-bound routed-expert feed that dominates GLM-5.2 (37B active, 8/256 experts).
+- Notably, its CPU MXFP4→BF16 unpack patch (the SAME vpermw+E8M0 technique we closed as a glmrt
+  CPU negative) DID win there (+6-7% single, +26-48% concurrent) — because kt-kernel's AMX BRGEMM
+  path is more compute-bound at concurrency; it does NOT contradict our N=1 bandwidth-bound finding.
+
+**Ceiling measurement (this box, from weight sizes; bandwidth-bound ⇒ time ∝ bytes):**
+- Per-token MoE-weight reads: routed experts = 8×75×20.05 MB = **12.03 GB (86.6%)**; shared expert
+  = 75×20.05 MB = 1.50 GB; dense MLP layers 0-2 = 3×120.32 MB = 0.36 GB.
+- **Always-hit, VRAM-fitting set (shared + dense 0-2) = 1.87 GB/token = only 13.4%** of MoE-weight
+  bytes; persistent VRAM footprint 1.87 GB (fits 64 GB trivially).
+- Mapped to measured decode (expert-matmul 15.22s = 73% of 20.84s N=1 decode): a GPU tier that
+  removed the always-hit bytes from the CPU critical path has a **sequential ceiling of ~9.8% of
+  decode (~2.04s of 20.84s).** Under an overlap model the realizable gain is bounded by the longer
+  path (CPU routed = 86.6%), so overlapping away the always-hit 13.4% yields **≤~10% end-to-end**.
+
+**FINAL VERDICT — SHELVE.** To capture even that ≤10% ceiling on B70 we would first have to build
+an **async CPU/GPU overlap pipeline that glmrt does not have** (its GPU path is fully synchronous),
+which is the bulk of the effort — for a bandwidth-bound ≤10% ceiling, on the wrong model (GLM-5.2's
+37B active dwarfs V4-Flash's 13B). The production hybrid's boost comes from (i) disk elimination
+(already banked here) and (ii) CPU/GPU overlap on a deliberately-low-active-param model — neither
+transfers to a B70 hot-expert/compute tier for GLM-5.2 CPU-resident decode. The Level-Zero
+infrastructure finding (§5a) is preserved for any future narrow experiment, but no backend is
+justified now.
+
 ---
 
 ## 5. Level-Zero vs SYCL — decision matrix (choice DEFERRED behind a spike)
@@ -210,12 +339,20 @@ the provisional SYCL to Level-Zero**, driven by the lean-build constraint.
    one B70 via each API; record link footprint of each. → picks L0 vs SYCL.
    **DONE (see §5a): both PASS; chose Level-Zero.**
 2. Measure **expert hit-frequency distribution** on the deterministic REPLAY harness to size the
-   hot-expert VRAM residency set (what fits in 64 GB, expected hit-rate). **← NEXT**
-3. Prototype `coli_xpu_expert_mlp` (single hot expert, MXFP4-in-VRAM) behind `COLI_XPU`; validate
-   wall-clock N=1 & N=16 + SCORE 0-flip gate before landing anything. Kernel = OpenCL C → SPIR-V
-   via `ocloc`, loaded into a L0 module; remember to insert `zeCommandListAppendBarrier` between
-   dependent commands (H2D → kernel → D2H).
-4. Only then wire the full `backend_xpu.{h,cpp}` API + Makefile `XPU=1` path (link `-lze_loader`).
+   hot-expert VRAM residency set (what fits in 64 GB, expected hit-rate).
+   **DONE (see §4a): distribution nearly FLAT — static 56 GB hot-set caps at ~53% hit-rate.
+   This casts doubt on the whole hot-set strategy.**
+3. **Batched (N=16) expert-reuse.** DONE (see §4b): batch-union reuse is only **1.27 rows/expert**
+   at N=16 (combinatorics + wall-clock, expert-matmul −8.9% only). Concentration is NOT restored by
+   batching → the caveat is resolved as a NEGATIVE.
+5. **Ceiling + hybrid reconciliation.** DONE (see §4c): always-hit VRAM-fitting set (shared +
+   dense 0-2) = 13.4% of MoE-weight bytes → sequential ceiling ~9.8% of decode, ≤~10% under
+   overlap. The production NVIDIA+AMX hybrid's boost = disk-elimination (already banked here) +
+   CPU/GPU overlap on a low-active-param model (V4-Flash 13B); glmrt has NO overlap pipeline
+   (synchronous GPU path). Verdict stands: **SHELVE.**
+6. **DONE-DECISION: shelve.** No `COLI_XPU` backend justified for GLM-5.2 CPU-resident decode.
+   Preserve the Level-Zero infra finding (§5a) for any future narrow experiment. Record the
+   negative in `docs/glm52-cpu/serial-profile.md` alongside MXFP4-LUT / MoE-AMX.
 
 ---
 
