@@ -237,3 +237,148 @@ and a patched lookahead-depth sweep (1/3/7):
   nothing the HW L2 streamer wasn't already getting from the matmul's natural access pattern.
   Root-causing the MoE bottleneck further needs stall-cycle profiling of the kernel itself,
   not more prefetch tuning.
+
+---
+
+## Per-function hot-spot profile (`perf record`, independent verification)
+
+The INSTR phase timers above are wall-clock brackets around code regions. To (a) confirm them
+against an independent method and (b) get *function*- and *instruction*-level attribution, a
+`sudo perf record -F 999 --call-graph dwarf` was run on a disposable
+`-g -fno-omit-frame-pointer` build (`glm.perf.bin`, numerically identical to the committed
+binary; note the Makefile `LDFLAGS -lm -pthread -lnuma` must be added to the literal compile
+line or the link fails). 20-step N=1 single-thread decode (`ref_bench_20steps.json`; there is
+**no `STEPS` env knob**, so a truncated ref file is the only way to cap step count without
+editing source).
+
+**Cold-cache caveat that had to be handled:** on a cold run, model load (~172 s) is roughly
+equal to decode (~175 s), so a naive whole-run flat profile misattributes ~50% of samples to
+load. The decode window was isolated with `perf report --time <start>,<stop>`, derived from the
+program's own reported decode duration (174 K decode-window samples, 0 lost — matches
+999 Hz × 175 s).
+
+### Decode-only flat profile (self %)
+
+| Self % | Symbol | Phase |
+|-------:|--------|-------|
+| 66.70% | `matmul_mxfp4_bf16._omp_fn.0` | MoE routed/sparse experts (MXFP4 × BF16) |
+| 19.17% | `matmul_i4_grouped._omp_fn.0` | **three call sites** — see split below |
+| 6.30%  | `matmul_q_idot._omp_fn.0` | 5.67% o_proj (VNNI `dot_i8i8`) + 0.63% lm_head |
+| 5.88%  | `attention_rows._omp_fn.1` (self) | absorb-core (inlined `qt_matvec_rows`/`qt_addrow`, kv_b) |
+| 1.50%  | `matmul._omp_fn.0` | MoE router / gate logits (unquantized) |
+| ≤0.04% | `moe.constprop.0`, `__expf_fma`, `matmul_qt_ex`, `f32_to_bf16_buf`, memmove | orchestration / softmax exp / dispatch / activation conv / memcpy |
+
+Top 5 = **99.55%** of decode self-time. `rmsnorm`/`rope` are fully inlined and never appear as
+distinct symbols; `qrow_i8` (int8 activation quant) rounds to 0.00%. Everything past the top ~9
+userspace symbols is sub-0.02% OS scheduler-tick noise.
+
+**Cross-validation vs the INSTR timers — agreement within ~1 pp on every phase:**
+
+| perf-sampled | value | INSTR timer | value |
+|--------------|------:|-------------|------:|
+| o_proj (`matmul_q_idot` attn slice) | 5.67% | output projection | 5.84% |
+| absorb-core (`attention_rows` self) | 5.88% | score-softmax-value | 5.48% |
+| q/kv-proj (`matmul_i4_grouped` attn slice) | 10.38% | projection/RoPE | 9.68% |
+| lm_head | 0.63% | lm_head | 0.64% |
+| routed experts (`matmul_mxfp4_bf16`) | 66.70% | expert-matmul | 68.7% |
+
+Two independent methods (statistical sampling vs instrumented wall-clock) agree to ~1 pp — high
+confidence in the attribution.
+
+### `matmul_i4_grouped` is three things (call-graph attribution)
+
+The single 19.17% symbol splits across three distinct callers — this is the key refinement the
+phase view hid:
+
+| Sub-slice | % decode | Caller | `allow_idot` |
+|-----------|---------:|--------|:------------:|
+| q_a / q_b / kv_a down-projections (+ DSA `ix_wk`) | 10.38% | `attention_rows → matmul_qt_ex` | **0** |
+| MoE **shared expert** (always-on `sh_gate`/`sh_up`/`sh_down`) | 7.25% | `moe → matmul_qt → matmul_qt_ex` | 1 |
+| dense MLP (layers 0–2) | 1.54% | `dense_mlp → matmul_qt_ex` | 1 |
+
+All three go through the **unmodified AVX2** `matmul_i4_grouped` at S=1. (o_proj + kv_b escaped
+this kernel via the landed `AMX_REQUANT` requant.)
+
+### Instruction-level annotate — the two hot kernels
+
+**`matmul_mxfp4_bf16`** (66.7%): 93.75% of samples in one 12-instruction inner loop —
+FMA 43.5% (`vdpbf16ps` 27.8% + `vfmadd231ps` scale 15.7%), weight nibble loads 26.2%,
+nibble→bf16 unpack (LUT shuffle chain) 22.0%, loop overhead 4.3%. Activation f32→bf16 conv is
+0% (done once upfront). **Balanced — no single bottleneck; compute edges out load+unpack.** This
+is already good AVX-512-BF16 code; there is no easy win here.
+
+**`matmul_i4_grouped`** (19.2%, AVX2/256-bit): unpack/dequant 31.1%, memory load 21.6%
+(`vmovq`, only **8 B/iteration** — narrow), FMA **13.0%**, loop overhead 21.7%, epilogue
+horizontal-reduce 6.6%. **Overhead-bound per useful FLOP** — the actual arithmetic is only 13%;
+the rest is unpack + narrow loads + a horizontal reduce done *every* 128-element group. This is
+the optimization target below.
+
+### Cold-start surprise (not decode, but worth recording)
+
+The load-phase profile is dominated by an entirely different set: `expert_load`'s E8M0→float
+scale-table precompute (`scalbnf`/`ldexpf` libm) = **~54% of the 172 s load** (~93 s). It calls
+general-purpose libm for what is mathematically "build a power-of-2 float from an 8-bit
+exponent" — a bit-manipulation trick could do it far cheaper. It's a one-time cost (the
+precompute exists specifically to kill per-call `ldexpf` during decode, and `scalbnf` is indeed
+absent from the decode window), correctly amortized for real multi-token serving — but a
+legitimate, sizeable cold-start latency finding no decode-only timer would surface.
+
+## `matmul_i4_grouped` optimization plan (researched, not yet implemented)
+
+The 19.2% `matmul_i4_grouped` slice is the highest-value CPU-decode target left after the
+requant win (MoE is bandwidth-bound and already optimally vectorized; o_proj is done). Kernel at
+`c/glm.c:612–646`, signature
+`(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O, int gs)`.
+Current structure: `#pragma omp parallel for` over `O` → `s<S` → groups `g` (gs=128) → AVX2
+inner loop with an 8 B `_mm_loadl_epi64`, nibble unpack, 2× `_mm256_fmadd_ps` (16 elem/iter),
+and an `hsum256` **every group** then scalar scale-accumulate. It is AVX2 only because it was
+never ported — `dot_i4f_avx512`/`axpy_i4f_avx512` (`glm.c:369–395`) already implement the
+AVX-512 version of this exact unpack (validated by `i4_acc512_selftest`, `I4_ACC512_TEST=1`).
+
+**All target tensors have `I` an exact multiple of 128** (6144, 2048, 12288) → **no ragged tail
+in production.**
+
+Microbenchmark (built in `/tmp`, deleted, `glm.c` untouched; all validated ~1e-7 rel err vs f64
+reference, on real model shapes, single-thread):
+
+| Variant | Technique | Speed vs current |
+|---------|-----------|-----------------:|
+| baseline (today's AVX2) | — | 1.00× |
+| naive AVX-512 | reuse `dot_i4f_avx512` per group | 1.44–1.49× |
+| **v_def4** | AVX-512 + **deferred per-group reduction** (keep the unreduced partial-sum vector across K-groups, scale-FMA each group into a persistent accumulator, reduce **once** at end-of-row) + **4-row register block** (share activation loads across 4 weight rows, like `matmul_mxfp4_bf16`) | **1.67–1.73×** |
+| VNNI/int8 | weight→int8 per-row + activation→int8 + `dot_i8i8` | 2.85–3.21× |
+
+Why v_def4 is the pick: the deferred reduction directly attacks the profile's two biggest
+non-arithmetic buckets (loop overhead 21.7% + per-group hsum 6.6%), the wider loads attack the
+narrow-8 B-load 21.6%, and it is **fp32-math-unchanged → ~zero quality risk** (pure
+reassociation; the same class of change as commit `2aff633` which showed 0 SCORE flips).
+
+### Ranked plan
+
+| Rank | Action | Applies to | Risk | Kernel × | Est. decode gain* |
+|-----:|--------|------------|------|---------:|------------------:|
+| **1** | AVX-512 port, deferred-reduction + 4-row block (v_def4) | all 3 sub-slices (19.2%) | ~zero (fp32 unchanged) | 1.7× | 19.2·(1−1/1.7) ≈ **7.9 pts → ~+8.6% tok/s** |
+| 1a | fallback: naive AVX-512 (call `dot_i4f_avx512` per group) | all 3 | ~zero, less work | 1.45× | ~6.0 pts → ~+6.3% |
+| **2** | VNNI/int8 requant, **only if SCORE-gate passes** | shared-expert + dense-MLP (8.8%) — **q/kv stays on #1** | moderate, must be gated | 2.85–3.21× | +5.9 pts more → ~+11.3% combined |
+| 3 | fuse shared-expert gate+up into one OMP region | shared-expert | ~zero, bit-identical | — | OMP-launch reduction (invisible at 1 thread) |
+| — | AMX grouped kernel / LUT unpack / streaming prefetch | — | — | — | **not applicable** at S=1 |
+
+\* first-order ceiling arithmetic (`saved% = self% · (1 − 1/×)`), single-thread microbench — not
+a substitute for the real A/B.
+
+**Why q_a/q_b/kv_a stay off VNNI (#2):** the same measured +0.117 nat/tok / +12% perplexity
+precedent (`allow_idot=0` at every call site). Shared-expert + dense-MLP are *always-active*
+(no routing sparsity → structurally closer to o_proj, which is proven safe on the weight-requant
+axis) but their int8-*activation* risk is genuinely untested — resolvable **only** by the SCORE
+gate, not by assumption. AMX grouped kernel is irrelevant here: it only gates at S≥16 and loses
+to VNNI at S=1 (perf confirmed AMX is completely idle — 0 `_tile_dpbssd` samples — during N=1
+decode).
+
+**Validation harness for the eventual implementation:** (1) bit-exact selftest vs scalar
+reference (extend the `i4_acc512_selftest` pattern, or the `amx_idot_selftest.c`
+`#define main …`/`#include "glm.c"` trick to reach static functions); (2) SCORE gate (0 flips),
+run **twice** — once for #1 fp32-alone (expect noise-level delta) and once for #2's
+shared/dense requant specifically (the real unknown); (3) perf A/B via INSTR — but note **no
+existing timer cleanly isolates the shared expert from the routed fmt=5 experts** (the
+`t_moe_kernel` "fmt=4" comment at ~:3995 is stale), so a clean shared-expert A/B likely needs a
+small dedicated timer added, mirroring the existing `t_aproj`/`t_aout` pattern.
