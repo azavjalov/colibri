@@ -148,6 +148,7 @@ typedef struct {
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
     uint8_t *e8;  /* fmt=5 MXFP4: E8M0 power-of-2 group-scale bytes [O,I/32], scale=2^(b-127); gs=32; s unused */
+    float *cb;    /* fmt=6 IQ3: per-tensor 8-entry signed codebook (weight_cb sidecar); e8+s as fmt=5 */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -177,6 +178,8 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*ng*4; }
     if(t->fmt==5){ /* MXFP4: E2M1 nibbles (I/2 B) + E8M0 group bytes (I/32 B), gs=32 */
         return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*((t->I+31)/32); }
+    if(t->fmt==6){ /* IQ3: 3-bit codes (ceil(3I/8) B/row) + E8M0 group bytes (I/32 B) + 8*4 B codebook */
+        return (int64_t)t->O*((3*(int64_t)t->I+7)/8) + (int64_t)t->O*((t->I+31)/32) + 32; }
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
@@ -342,6 +345,20 @@ static int parse_cuda_devices(const char *list, int *out){
 }
 #endif
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+/* perf --control=fifo fence: write "enable"/"disable" to the ctl fifo so an
+ * attached `perf stat --control=fifo:CTL,ACK --delay=-1` brackets EXACTLY the
+ * region between perf_fifo(1) and perf_fifo(0). Env PERF_FIFO=ctl[,ack].
+ * ack read is best-effort (perf echoes "ack\n"). No-op if PERF_FIFO unset. */
+static void perf_fifo(int on){
+    const char *e=getenv("PERF_FIFO"); if(!e||!*e) return;
+    char ctl[512],ack[512]; ctl[0]=ack[0]=0;
+    const char *c=strchr(e,','); 
+    if(c){ size_t n=(size_t)(c-e); if(n>=sizeof ctl)n=sizeof ctl-1; memcpy(ctl,e,n); ctl[n]=0; snprintf(ack,sizeof ack,"%s",c+1); }
+    else snprintf(ctl,sizeof ctl,"%s",e);
+    FILE *fc=fopen(ctl,"w"); if(!fc){ perror("[perf_fifo] open ctl"); return; }
+    fputs(on?"enable\n":"disable\n",fc); fflush(fc); fclose(fc);
+    if(ack[0]){ FILE *fa=fopen(ack,"r"); if(fa){ char b[64]; if(fgets(b,sizeof b,fa)){} fclose(fa); } }
+}
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #ifdef __APPLE__
     return r.ru_maxrss/(1024.0*1024.0*1024.0);   /* macOS: ru_maxrss in BYTE */
@@ -595,6 +612,114 @@ static void matmul_mxfp4_bf16(float *y, const uint16_t *abf16, const uint8_t *q4
               acc=_mm512_fmadd_ps(_mm512_set1_ps(scl[jj][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,(__m512bh)_mxfp4_to_bf16_32(_mm_loadu_si128((const __m128i*)(ww+g*16)))),acc); }
             yr[o4+jj]=_mm512_reduce_add_ps(acc); } }
       } }
+}
+/* ===================== IQ3 expert kernel (fmt=6) =====================
+ * 3-bit codes indexing a per-tensor 8-entry signed codebook + E8M0 per-32-group
+ * power-of-2 scale (gs=32). Weight bytes = ceil(3*I/8) per row, LSB-first stream
+ * (code k in bits [3k,3k+3) of the little-endian byte array); scale = 2^(e8-127).
+ * Dequant: unpack 3-bit code -> cb[code] (as bf16) -> dot via _mm512_dpbf16_ps,
+ * scaled by the group's E8M0. y[S,O]=x[S,I]@W^T. Mirrors matmul_mxfp4's structure;
+ * the fixed E2M1 shuffle-LUT is replaced by a per-tensor codebook loaded into a
+ * _mm512_permutexvar_epi16 table (8 entries fit the low half of the 32-lane perm).
+ * IQ3_TEST=1 cross-checks this vs a scalar f64 oracle. */
+static inline __m512i _iq3_cb_lut(const float *cb){
+    uint16_t b[32];
+    for(int i=0;i<8;i++){ uint32_t u; float f=cb[i]; memcpy(&u,&f,4); uint16_t bf=(uint16_t)((u+0x8000)>>16); b[i]=bf; b[i+8]=bf; b[i+16]=bf; b[i+24]=bf; }
+    return _mm512_loadu_si512((const void*)b);
+}
+/* Unpack 32 3-bit codes (12 bytes, LSB-first) into 32 epi16 lanes [0..7]. */
+static inline __m512i _iq3_unpack32(const uint8_t *p){
+    uint16_t idx[32];
+    uint64_t lo; uint32_t hi; memcpy(&lo,p,8); memcpy(&hi,p+8,4);   /* 96 bits = 12 bytes */
+    unsigned __int128 bitstream = ((unsigned __int128)hi<<64) | lo;
+    for(int k=0;k<32;k++){ idx[k]=(uint16_t)((bitstream >> (3*k)) & 0x7); }
+    return _mm512_loadu_si512((const void*)idx);
+}
+static inline __m512i _iq3_to_bf16_32(const uint8_t *codes12, __m512i lut){
+    return _mm512_permutexvar_epi16(_iq3_unpack32(codes12), lut);
+}
+static void matmul_iq3(float *y, const float *x, const uint8_t *q3, const float *sf,
+                       const float *cb, int S, int I, int O){
+    const int kg=I/32, rb=(3*I)/8, ng=I/32;
+    const __m512i lut=_iq3_cb_lut(cb);
+    #pragma omp parallel
+    {
+      #pragma omp for schedule(static)
+      for(int o4=0;o4<O;o4+=4){
+        int nb=(o4+4<=O)?4:(O-o4);
+        const float *scl[4]; const uint8_t *w[4];
+        for(int j=0;j<nb;j++){ scl[j]=sf+(int64_t)(o4+j)*ng; w[j]=q3+(int64_t)(o4+j)*rb; }
+        int st=0;
+        if(nb==4){
+          for(; st+4<=S; st+=4){
+            __m512 acc[4][4]; for(int i=0;i<4;i++)for(int j=0;j<4;j++) acc[i][j]=_mm512_setzero_ps();
+            const float *ax[4]={x+(int64_t)(st+0)*I,x+(int64_t)(st+1)*I,x+(int64_t)(st+2)*I,x+(int64_t)(st+3)*I};
+            for(int g=0;g<kg;g++){
+              __m512bh d0=(__m512bh)_iq3_to_bf16_32(w[0]+(int64_t)g*12,lut);
+              __m512bh d1=(__m512bh)_iq3_to_bf16_32(w[1]+(int64_t)g*12,lut);
+              __m512bh d2=(__m512bh)_iq3_to_bf16_32(w[2]+(int64_t)g*12,lut);
+              __m512bh d3=(__m512bh)_iq3_to_bf16_32(w[3]+(int64_t)g*12,lut);
+              for(int i=0;i<4;i++){ __m512bh av=_f32x32_to_bf16(ax[i]+g*32);
+                acc[i][0]=_mm512_fmadd_ps(_mm512_set1_ps(scl[0][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d0),acc[i][0]);
+                acc[i][1]=_mm512_fmadd_ps(_mm512_set1_ps(scl[1][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d1),acc[i][1]);
+                acc[i][2]=_mm512_fmadd_ps(_mm512_set1_ps(scl[2][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d2),acc[i][2]);
+                acc[i][3]=_mm512_fmadd_ps(_mm512_set1_ps(scl[3][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,d3),acc[i][3]); }
+            }
+            for(int i=0;i<4;i++){ float*yr=y+(int64_t)(st+i)*O+o4;
+              yr[0]=_mm512_reduce_add_ps(acc[i][0]); yr[1]=_mm512_reduce_add_ps(acc[i][1]);
+              yr[2]=_mm512_reduce_add_ps(acc[i][2]); yr[3]=_mm512_reduce_add_ps(acc[i][3]); }
+          }
+        }
+        for(; st<S; st++){ const float *ar=x+(int64_t)st*I; float*yr=y+(int64_t)st*O;
+          for(int j=0;j<nb;j++){ const uint8_t*ww=w[j]; __m512 acc=_mm512_setzero_ps();
+            for(int g=0;g<kg;g++){ __m512bh av=_f32x32_to_bf16(ar+g*32);
+              acc=_mm512_fmadd_ps(_mm512_set1_ps(scl[j][g]),_mm512_dpbf16_ps(_mm512_setzero_ps(),av,(__m512bh)_iq3_to_bf16_32(ww+(int64_t)g*12,lut)),acc); }
+            yr[o4+j]=_mm512_reduce_add_ps(acc); }
+        }
+      }
+    }
+}
+/* IQ3_TEST=1: validate matmul_iq3's unpack+codebook-LUT+E8M0-scale+dot against a scalar
+ * f64 oracle, using an arbitrary codebook and random codes (quantizer quality is proven in
+ * the Python converter; this proves the C dequant/dot matches the format spec bit-for-bit
+ * to bf16 tolerance). Returns 1 on PASS, 0 on FAIL. */
+static int iq3_selftest(void){
+    const int O=20, I=256, S=3, ng=I/32, rb=(3*I)/8;
+    float cb[8]={-5.9f,-3.4f,-1.85f,-0.58f,0.53f,1.8f,3.57f,6.0f};
+    uint8_t *q3=(uint8_t*)malloc((size_t)O*rb);
+    float *sf=(float*)malloc((size_t)O*ng*sizeof(float));
+    uint8_t *e8=(uint8_t*)malloc((size_t)O*ng);
+    float *x=(float*)malloc((size_t)S*I*sizeof(float));
+    float *y=(float*)malloc((size_t)S*O*sizeof(float));
+    uint8_t *codes=(uint8_t*)malloc((size_t)O*I);
+    unsigned rng=12345u;
+    #define RND() (rng=rng*1103515245u+12345u,(rng>>16)&0x7fff)
+    for(int i=0;i<S*I;i++) x[i]=((float)RND()/16384.f-1.f)*0.1f;
+    for(int o=0;o<O;o++){
+        for(int g=0;g<ng;g++){ int e=110+(int)(RND()%20); e8[o*ng+g]=(uint8_t)e; sf[o*ng+g]=ldexpf(1.0f,e-127); }
+        for(int i=0;i<I;i++) codes[o*I+i]=(uint8_t)(RND()&0x7);
+        /* pack LSB-first: code i in bits [3i,3i+3) of row byte stream */
+        memset(q3+(size_t)o*rb,0,rb);
+        for(int i=0;i<I;i++){ int bit=3*i; uint8_t c=codes[o*I+i];
+            for(int b=0;b<3;b++) if(c&(1<<b)){ int bb=bit+b; q3[(size_t)o*rb+(bb>>3)]|=(uint8_t)(1<<(bb&7)); } }
+    }
+    matmul_iq3(y,x,q3,sf,cb,S,I,O);
+    double maxrel=0; int bad=0;
+    for(int st=0;st<S;st++) for(int o=0;o<O;o++){
+        double acc=0, amag=0;
+        for(int i=0;i<I;i++){ int g=i/32; double term=(double)cb[codes[o*I+i]]*(double)sf[o*ng+g]*(double)x[st*I+i];
+            acc += term; amag += fabs(term); }
+        /* denominator = sum of |term| (the natural scale of a random-sign dot), NOT |acc|
+         * which suffers catastrophic cancellation on random data and would inflate rel-err
+         * for reasons unrelated to the kernel. This mirrors what an actual matmul row sees. */
+        double got=y[st*O+o], den=amag>1e-9?amag:1e-9, rel=fabs(got-acc)/den;
+        if(rel>maxrel) maxrel=rel;
+    }
+    printf("[iq3_selftest] O=%d I=%d S=%d  max_rel_err(vs |term|-sum)=%.4e (bf16 tol ~1e-2)\n",O,I,S,maxrel);
+    #undef RND
+    free(q3);free(sf);free(e8);free(x);free(y);free(codes);
+    if(maxrel>3e-2){ printf("[iq3_selftest] FAIL\n"); bad=1; }
+    return bad?0:1;
 }
 /* convert S*I f32 -> S*I bf16 (linear order) into dst; parallel over rows. */
 static void f32_to_bf16_buf(uint16_t *dst, const float *src, int64_t n){
@@ -1683,6 +1808,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * at smaller S it loses to the int4 grouped kernel, but fmt=5 experts have no int4 form,
      * so below the threshold we still call matmul_mxfp4 (correct, just not the fastest regime). */
     if(w->fmt==5){ matmul_mxfp4(y,x,w->q4,w->s,S,w->I,w->O); return; }
+    if(w->fmt==6){ matmul_iq3(y,x,w->q4,w->s,w->cb,S,w->I,w->O); return; }
 #endif
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
     /* int8 IDOT vince sempre (1.4-2.5x). int4 IDOT: l'autore su AVX2 trovo' che a S=1
@@ -2187,6 +2313,15 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal);
 static int g_mmap=0;
 static int g_mxfp4_smin=8;        /* MXFP4_SMIN: min S to use the MXFP4 bf16 kernel (fmt=5); below this the int4/f32 path is faster at decode */
 static int g_instr=0;             /* INSTR=1: MoE kernel-vs-orchestration timing split + pcall count */
+/* IMATRIX=<file>: activation-importance capture for low-bit (fmt=6) quant.
+ * Accumulates sum(x_i^2) per input channel per (layer,expert) over a calibration
+ * (REPLAY) run. gate/up input = hidden(D); down input = moe_inter(I). Dumped at exit
+ * as a flat binary: header {int32 magic 'IMAT'=0x54414D49, L, E, D, I} then
+ * f64[L*E*D] (gate/up) then f64[L*E*I] (down). Read by conv-glm52-iq2.py. */
+static const char *g_imat=NULL;   /* IMATRIX target path, NULL=off */
+static double *g_imat_gu=NULL;    /* [L*E*D] sum x^2 for gate/up input */
+static double *g_imat_dn=NULL;    /* [L*E*I] sum x^2 for down input */
+static int g_imat_L=0,g_imat_E=0,g_imat_D=0,g_imat_I=0;
 static int g_numa_partition=1;    /* NUMA_PARTITION (default ON): mbind resident expert tensors across
                                     * NUMA nodes at wire time -- DATA PLACEMENT ONLY, no compute-side
                                     * thread/node pinning (separate later task). NUMA_PARTITION=0 skips
@@ -2657,12 +2792,14 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
         s->eid=eid; return 0;
     }
-    st_tensor *tw[3], *tq[3]; int is_mx[3]={0,0,0};
+    st_tensor *tw[3], *tq[3], *tcb[3]={0,0,0}; int is_mx[3]={0,0,0};
     for(int k=0;k<3;k++){
         tw[k]=st_find(&m->S,nm[k]);
         snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
-        if(!tq[k]){ /* MXFP4 (fmt=5): E8M0 byte scales in a .weight_scale sidecar */
+        if(!tq[k]){ /* MXFP4 (fmt=5) / IQ3 (fmt=6): E8M0 byte scales in a .weight_scale sidecar */
             snprintf(qn,sizeof(qn),"%s_scale",nm[k]); tq[k]=st_find(&m->S,qn); if(tq[k]) is_mx[k]=1; }
+        /* IQ3 (fmt=6): additional per-tensor 8-entry codebook sidecar .weight_cb */
+        snprintf(qn,sizeof(qn),"%s_cb",nm[k]); tcb[k]=st_find(&m->S,qn);
         if(!tw[k]||!tq[k]){ fprintf(stderr,"missing %s\n",nm[k]); if(fatal) exit(1); return -1; }
     }
     if(g_disk_split){ /* split load/byte per tipo layer; atomici: expert_load gira anche su OMP/pipe/pilot */
@@ -2686,15 +2823,21 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
                 int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
                 /* detect grouped int4 (fmt=4): int4 weight bytes + larger scale array */
                 int gs=0;
-                if(is_mx[k]){ fmt=5; gs=32; }   /* MXFP4: E2M1 nibbles + E8M0 byte scales, gs=32 */
+                if(is_mx[k] && tcb[k] && nb==(int64_t)OO[k]*((3*(int64_t)II[k]+7)/8)){ fmt=6; gs=32; }  /* IQ3: 3-bit codes + E8M0 + codebook */
+                else if(is_mx[k]){ fmt=5; gs=32; }   /* MXFP4: E2M1 nibbles + E8M0 byte scales, gs=32 */
                 else { if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes); if(gs>0) fmt=4; }
-                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL; qt[k]->e8=NULL;
+                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL; qt[k]->e8=NULL; qt[k]->cb=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
-                if(fmt==5){ qt[k]->e8=(uint8_t*)((char*)bq[k]+tq[k]->off);
+                if(fmt==5||fmt==6){ qt[k]->e8=(uint8_t*)((char*)bq[k]+tq[k]->off);
                     int ng5=(II[k]+31)/32; int64_t nsc=(int64_t)OO[k]*ng5;
                     qt[k]->s=malloc(nsc*sizeof(float));   /* precompute E8M0->f32 once (kills per-call ldexpf) */
                     for(int64_t z=0;z<nsc;z++) qt[k]->s[z]=ldexpf(1.0f,(int)qt[k]->e8[z]-127); }
                 else       qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
+                if(fmt==6){ /* copy the tiny 8-entry codebook out of the mapped file into owned mem */
+                    void *bcb=map_of_fd(tcb[k]->fd);
+                    qt[k]->cb=malloc(8*sizeof(float));
+                    if(bcb) memcpy(qt[k]->cb,(char*)bcb+tcb[k]->off,8*sizeof(float));
+                    else { float tmp[8]; if(!pread_full(tcb[k]->fd,(char*)tmp,8*sizeof(float),tcb[k]->off,"pread cb")) memcpy(qt[k]->cb,tmp,8*sizeof(float)); } }
             }
             /* CPU pre-touch: fault the pages in HERE (cheap, parallel, overlapped with the
              * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
@@ -2811,6 +2954,11 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
     }
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
     for(int k=0;k<3;k++){
+        if(is_mx[k]){ /* MXFP4 (fmt=5) / IQ3 (fmt=6) use E8M0 byte scales -> require the mmap
+                       * load path above (this pread fallback reads f32 scales). GLM runs with
+                       * COLI_MMAP=1, so this is unreachable for those formats in practice. */
+            fprintf(stderr,"expert_load: MXFP4/IQ3 expert requires mmap path (set COLI_MMAP=1): %s\n",nm[k]);
+            if(fatal) exit(1); return -1; }
         int64_t nb=tw[k]->nbytes;
         int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
         int gs=0;
@@ -2992,6 +3140,9 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     for(int k=0;k<3;k++){
         fp[k]=s->fslab+fo; fo+=l->tq[k]->nbytes/4;
         int64_t nb=l->tw[k]->nbytes;
+        /* NB: MXFP4 (fmt=5) / IQ3 (fmt=6) carry E8M0 byte scales (+ IQ3 codebook) which this
+         * io_uring/f32-scale finalize path does not wire; they require the mmap load path
+         * (GLM runs COLI_MMAP=1, so this path is never taken for those formats). */
         int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
@@ -3684,7 +3835,35 @@ static int expert_is_resident(Model *m, int layer, int eid){
     return 0;
 }
 
+static void imat_init(Model *m){
+    if(!g_imat) return;
+    g_imat_L=m->c.n_layers; g_imat_E=m->c.n_experts; g_imat_D=m->c.hidden; g_imat_I=m->c.moe_inter;
+    size_t ngu=(size_t)g_imat_L*g_imat_E*g_imat_D, ndn=(size_t)g_imat_L*g_imat_E*g_imat_I;
+    g_imat_gu=calloc(ngu,sizeof(double)); g_imat_dn=calloc(ndn,sizeof(double));
+    if(!g_imat_gu||!g_imat_dn){ fprintf(stderr,"[IMATRIX] alloc failed (%zu+%zu doubles)\n",ngu,ndn); g_imat=NULL; free(g_imat_gu); free(g_imat_dn); g_imat_gu=g_imat_dn=NULL; return; }
+    fprintf(stderr,"[IMATRIX] capturing to %s (L=%d E=%d D=%d I=%d, %.2f GB)\n",g_imat,g_imat_L,g_imat_E,g_imat_D,g_imat_I,(ngu+ndn)*8.0/1e9);
+}
+/* accumulate sum(x^2) per input channel. gu=1 -> gate/up (width D), gu=0 -> down (width I). */
+static void imat_accum(int layer,int eid,const float *x,int nr,int gu){
+    if(!g_imat_gu) return;
+    if(layer<0||layer>=g_imat_L||eid<0||eid>=g_imat_E) return;
+    int W = gu? g_imat_D : g_imat_I;
+    double *acc = (gu? g_imat_gu : g_imat_dn) + (size_t)(layer*g_imat_E+eid)*W;
+    for(int r=0;r<nr;r++){ const float *xr=x+(int64_t)r*W;
+        for(int i=0;i<W;i++){ double v=xr[i]; acc[i]+=v*v; } }
+}
+static void imat_dump(void){
+    if(!g_imat||!g_imat_gu) return;
+    FILE *f=fopen(g_imat,"wb"); if(!f){ fprintf(stderr,"[IMATRIX] cannot open %s\n",g_imat); return; }
+    int32_t hdr[5]={0x54414D49,g_imat_L,g_imat_E,g_imat_D,g_imat_I};
+    fwrite(hdr,sizeof(int32_t),5,f);
+    fwrite(g_imat_gu,sizeof(double),(size_t)g_imat_L*g_imat_E*g_imat_D,f);
+    fwrite(g_imat_dn,sizeof(double),(size_t)g_imat_L*g_imat_E*g_imat_I,f);
+    fclose(f);
+    fprintf(stderr,"[IMATRIX] wrote %s\n",g_imat);
+}
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
+    if(g_imat && !g_imat_gu) imat_init(m);
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
                          * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
@@ -4190,6 +4369,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
               for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
               matmul_qt(hh, gg, &e->d, nr); }
             if(g_instr){ m->t_moe_kernel += now_s()-_tk0; m->moe_pcalls += 3; }  /* gate+up+down = 3 parallel regions (fmt=4) */
+            if(g_imat_gu){ imat_accum(layer,eid,xg,nr,1); imat_accum(layer,eid,gg,nr,0); }
             double _ts0=now_s();
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -5490,9 +5670,11 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
     profile_reset(m);
     double t0=now_s(); int steps=0;
+    perf_fifo(1);  /* begin decode-only perf window */
     for(int i=np-1;i<nfull-1;i++){
         logit=step(m,full+i,1,i); free(logit); steps++;
     }
+    perf_fifo(0);  /* end decode-only perf window */
     double dt=now_s()-t0, tot=m->hits+m->miss;
     printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
         steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
@@ -6844,6 +7026,10 @@ int main(int argc, char **argv){
         if(!i4g512_selftest()) return 1;
         puts("AVX512 i4 selftest: ok"); return 0;
     }
+    if(getenv("IQ3_TEST")){
+        if(!iq3_selftest()) return 1;
+        puts("IQ3 (fmt=6) selftest: ok"); return 0;
+    }
 #endif
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack = getenv("NOPACK")?1:0;
@@ -6855,6 +7041,8 @@ int main(int argc, char **argv){
     g_numa_partition = getenv("NUMA_PARTITION")?atoi(getenv("NUMA_PARTITION")):1;
     g_numa_compute   = getenv("NUMA_COMPUTE")?atoi(getenv("NUMA_COMPUTE")):1;
     g_instr          = getenv("INSTR")?atoi(getenv("INSTR")):0;
+    g_imat = getenv("IMATRIX"); if(g_imat && !*g_imat) g_imat=NULL;
+    if(g_imat) atexit(imat_dump);
     g_mxfp4_smin     = getenv("MXFP4_SMIN")?atoi(getenv("MXFP4_SMIN")):8;
     g_reserve_cores  = getenv("RESERVE_CORES")?atoi(getenv("RESERVE_CORES")):3;
     g_numa_smin      = getenv("NUMA_COMPUTE_SMIN")?atoi(getenv("NUMA_COMPUTE_SMIN")):8;

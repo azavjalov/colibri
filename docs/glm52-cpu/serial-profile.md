@@ -467,3 +467,286 @@ CUDA routed-expert tier is inert for native MXFP4 (`row_bytes()` returns 0 for f
 (37B active) is 3× the CPU feed of V4-Flash. So: to capture a ≤10% bandwidth-bound ceiling on B70
 we'd first have to build an async overlap pipeline glmrt lacks — not worth it. Same root cause as
 MXFP4-LUT / MoE-AMX: perf is gated by memory bandwidth, not by where compute runs.
+
+---
+
+## Task 4 — 2-bit routed-expert format (fmt=6) — ATTACK THE BANDWIDTH WALL (PLANNED)
+
+Rationale: every prior lever (MXFP4-LUT, MoE-AMX, B70 offload) died on the SAME cause — routed-
+expert decode reads **12.03 GB/token** from DRAM at ~42 GB/s (86.6% of MoE-weight bytes). Those were
+all compute-side or placement-side and had ZERO headroom. **Shrinking the weight FORMAT is the first
+lever that converts LINEARLY to tok/s in a bandwidth-bound regime.** A 2-bit routed format ≈ halves
+the feed. Model validated: 41.1B active / 743.2B total (reproduces published GLM-5.2).
+
+**Projection (expert-matmul 15.22s of 20.84s N=1 decode scales with feed bytes):**
+- MXFP4 4.25b (now): 3.84 tok/s.
+- ~2.06b routed: em 8.06s → decode 13.68s → **5.85 tok/s (~1.52×)**.
+- ~2.5b routed (if dynamic alloc needs it): decode 14.57s → **5.49 tok/s (~1.43×)**.
+
+**QUALITY GATE — DELIBERATELY RELAXED (user decision, m00130):** The prior HARD rule was
+zero-argmax-flips on the 36-probe/562-tok SCORE gate. Uniform 2-bit CANNOT meet that — Unsloth's own
+GLM-5.2 UD-IQ2_M reports **82% top-1 accuracy = ~18% argmax divergence vs BF16** (they argue it's
+filler/stop-word variation, not wrong answers; mean-KLD ~99.9%). So for Task 4 ONLY, the landing bar
+becomes **bounded-KLD/PPL**: mean-KLD ≥ ~99.9% and nat/tok (PPL) delta under a small threshold on the
+40T deterministic harness, allowing minor argmax divergence on low-signal tokens. This is a
+documented, intentional change to the landing bar for low-bit quant work — NOT a general relaxation.
+Precedent contrast: MXFP4-LUT was rejected at +0.0104 nat/tok under the OLD bar; under the NEW bar a
+few-× larger PPL delta for a 1.4-1.5× real speedup is acceptable.
+
+**Reference (Unsloth UD-IQ2_M):** NOT uniform 2-bit — it's DYNAMIC: attention, shared expert, router,
+embed/lm_head, and first/last blocks stay at 4-8 bit; only the least-important routed-expert tensors
+drop to ~2b (net ~245 GB, ~2.6b avg). Dynamic 1-bit = 76.2% top-1, dynamic 2-bit = 82% top-1, 4-bit
+UD-Q4_K_XL ≈ lossless. This maps PERFECTLY onto our need: the routed experts (86.6% of bandwidth) are
+ALSO the least argmax-sensitive per their layer-importance analysis — quantize those, keep the rest.
+
+**IMPLEMENTATION PLAN:**
+- **Scope:** 2-bit ONLY the 256×75 routed experts (fmt 5→6). Keep attention (fmt=1 int8), shared
+  expert (fmt=5 MXFP4), router/embed/lm_head as-is. This is the "dynamic" split, done at glmrt's
+  tensor granularity via the per-tensor `fmt` field (autodetected from `.qs` sidecar byte size,
+  glm.c:2046-2065 qt_from_disk).
+- **fmt=6 = next free** (verified: fmts 0-5 in use). Format candidates in preference order:
+  1. **IQ2-style: 2-bit codes + small importance codebook + per-group fp8 scale** (~2.3b effective) —
+     the proven Unsloth/llama.cpp path; best quality/bit. Dequant = 256-entry codebook lookup
+     (port `dequantize_row_iq2_*` from llama.cpp, then AVX-512 `vpermw`/gather version).
+  2. Fallback: naive per-group 2-bit + fp8 E8M0 scale (~2.25b) — trivial dequant (like MXFP4) but
+     worst quality; use only if IQ2 kernel proves too costly and the PPL gate still passes.
+- **Produce the checkpoint — via the EXISTING glmrt converter, NOT llama.cpp** (verified this
+  session): glmrt's loader (`qt_from_disk` glm.c:2043; `expert_load` glm.c:2641) reads glmrt's OWN
+  flat container — per-expert `...{gate,up,down}_proj.weight` (packed quant bytes) + a sidecar
+  (`.qs` = f32 scales for fmt≤4, or `_scale` = E8M0 bytes for fmt=5 MXFP4). **There is NO GGUF
+  ingest path**; llama.cpp's IQ2 super-block layout is incompatible, so llama-quantize is the WRONG
+  tool. Instead extend `/home/intel/b70-sglang-xpu/conv-glm52-mxfp4.py` (the proven FP8→MXFP4
+  producer; source `/srv/models/glm52-fp8`, 704 GB, 141 shards). It already: reads FP8-block source
+  (`dequant_fp8_block`, 128×128), dequantizes each expert-proj to f32 (`convert_one_expert_proj`),
+  and emits the flat container (`save_file` per `model-layer-NNN.safetensors` + index). Add a
+  `quantize_iq2(w_f32)` + `dequantize_iq2` pair mirroring `quantize_mxfp4`/`dequantize_mxfp4`
+  (glm.c-side names/round-trip already there for validate mode), plus a `--fmt {mxfp4,iq2}` arg. If
+  IQ2 uses an importance codebook, derive per-tensor codebook from the FP8 weights directly (k-means
+  on |w|), OR add an optional imatrix from the deterministic replay harness (ref_bench.json) — but
+  first try weight-only (no calibration) since Unsloth's static codebooks already do well.
+- **fmt=6 loader hook (exact, verified):** detection goes in `expert_load` at glm.c:2687-2689,
+  right after the `is_mx` (fmt=5) branch. fmt=5 is detected by presence of the `_scale` sidecar
+  (glm.c:2664-2665) → `fmt=5, gs=32`. For fmt=6, add: if the `_scale` sidecar is present AND weight
+  bytes `nb == O*(I/4)` (2-bit ⇒ I/4 bytes/row, vs I/2 for MXFP4) → `fmt=6, gs=32`. Store the fp32
+  codebook in a third sidecar `..._cb` (tiny, per-tensor). Mirror the fmt=5 E8M0→f32 precompute at
+  glm.c:2696-2699. The non-mmap path and `qt_from_disk` (glm.c:2043) need the parallel branch.
+- **fmt=6 dequant kernel:** new `matmul_iq2_bf16` cloned from `matmul_mxfp4_bf16` (glm.c:565) and
+  `matmul_iq2` from `matmul_mxfp4` (glm.c:520); dispatch at glm.c:1685 (`if(w->fmt==6)`). Unpack
+  2-bit code (4/byte) → codebook lookup (16-entry `_mm512_permutexvar_epi16` like the MXFP4 LUT, if
+  codebook ≤16 entries) → E8M0 group scale → `_mm512_dpbf16_ps`. Note `MXFP4_SMIN` analog
+  (`g_mxfp4_smin`, glm.c:2188) may want an `IQ2_SMIN`.
+- **Quality harness (mostly EXISTS):** SCORE `logprob_target()` (glm.c:5379) ALREADY sums
+  continuation log-prob + tracks greedy match; SCORE `.out` triple = `<logprob> <contlen> <greedy>`.
+  So nat/tok (PPL) delta is available with NO new infra — extend `score_compare.py` to gate on the
+  logprob-sum delta (bounded-PPL) instead of requiring zero greedy flips. True token-KLD would need
+  full logit-vector dump (glm.c has DEBUG_LOGITS top-5 at :7165) — nat/tok delta is the practical
+  proxy and is the primary gate.
+- **Validation:** wall-clock N=1 AND N=16 on the tuned REPLAY recipe (hard rule stands for PERF) +
+  bounded-KLD/PPL gate. Expect a per-tensor bit-allocation sweep (some experts may need 3-4b to hold
+  PPL) — realizable speedup likely 1.3-1.5×.
+- **Lean-build hygiene:** fmt=6 dequant is pure CPU C in glm.c (no new deps), guarded like the
+  existing AVX-512 paths. No impact on the lean default link.
+
+**Open risk:** zero-flip is off the table by design; the real question is whether ~2.3b routed holds
+mean-KLD ≥99.9% / small nat/tok delta, or whether dynamic allocation pushes the average toward ~2.6b
+(Unsloth's actual UD-IQ2_M avg) — which softens the win toward ~1.4×. Still the first bandwidth-
+cashing lever in this investigation.
+
+**Environment verified this session (ready to start):** source `/srv/models/glm52-fp8` (704 GB, 141
+shards) present; 3.8 TB free on `/`; converter `conv-glm52-mxfp4.py` present; two llama.cpp trees
+built (`/home/intel/llama.cpp`, `/home/intel/b70-llamacpp/llama.cpp`) — retained only as an IQ2
+codebook/algorithm REFERENCE, not in the production path. Loader hooks and converter template fully
+mapped (glm.c:565/520/1685/2043/2641/2687; conv-glm52-mxfp4.py quantize_mxfp4/save_file).
+
+**First concrete step:** add `quantize_iq2` to `conv-glm52-mxfp4.py`, run `--mode validate` on a
+handful of experts to measure rel-err vs FP8 f32 oracle (mirrors the existing MXFP4 validate path)
+BEFORE any full conversion or glm.c work — cheap go/no-go on the format's quality/bit tradeoff.
+
+### Task 4 — STEP 1 RESULT: weight-only (RTN, no calibration) 2-bit is a NO-GO
+
+Built `conv-glm52-iq2.py` (copy of the MXFP4 converter + `quantize_iq2`/`dequantize_iq2` and four
+design-probe variants). Ran `--mode validate` on routed experts sampled across layers 3/20/40/60/77.
+Reconstruction error vs the FP8 f32 oracle (60-tensor aggregate for the primary run; per-row cosine
+is the matmul-relevant metric):
+
+| Format | bits/wt | mean rel-err | mean row-cos |
+|---|---|---|---|
+| MXFP4 (fmt=5, today)            | ~4.25 | **0.108** | **0.9934** |
+| int4 gs128 (fmt=4)              | ~4.5  | 0.130 | ~0.99  |
+| gA — per-tensor 4-cb + E8M0     | ~2.25 | 0.376 | 0.933  |
+| gB — per-group 4-means + fp16 s | ~2.5  | **0.305** | **0.954** |
+| gC — per-group linear 2b + fp16 | ~2.25 | 0.508 | 0.881  |
+| gD — per-row 4-cb + amax scale  | ~2.5  | 0.364 | 0.938  |
+
+**Every weight-only 2-bit variant tops out at cos ≈ 0.954 / rel ≈ 0.30 (gB, the best) — ~2.8× worse
+rel-err than MXFP4 and clearly worse than int4.** `down_proj` is consistently the worst tensor
+(rel 0.36–0.47). Root cause: GLM-5.2 expert weights are near-Gaussian with no structure a cheap
+1-D per-group codebook exploits; round-to-nearest 2-bit simply has too few levels. This would fail
+the bounded-PPL gate. **Recorded as a clean negative: weight-only RTN 2-bit ≠ Unsloth UD-IQ2.**
+
+**Why Unsloth UD-IQ2 actually works (the missing ingredient):** it is NOT weight-only RTN. Its
+quality comes from (1) an **imatrix** — activation-importance weights per input channel, so the
+quantizer minimizes `Σ_i importance_i·(w_i − q_i)²` and pushes error onto channels the activations
+rarely excite — and (2) a large **shared multi-dimensional codebook** (llama.cpp IQ2_XXS/IQ2_S use
+256-entry 8-D lattice grids), not a per-group 1-D 4-level fit.
+
+### Task 4 — DECISION (user, this session): pursue the IMATRIX path
+
+Weight-only is abandoned. Next: build the imatrix pipeline.
+- **Capture:** run the deterministic replay harness (`ref_bench.json`, 80-step) with per-input-
+  channel activation-importance accumulation into the routed experts (sum of squared — or |x| —
+  activations feeding each expert's gate/up/down input dim). Deterministic ⇒ reproducible imatrix.
+- **Quantizer:** importance-weighted 2-bit — minimize `Σ_i imp_i·(w_i − q_i)²` per group (weighted
+  k-means / weighted nearest-centroid), optionally a shared codebook. Re-run `--mode validate`
+  reporting the **importance-WEIGHTED** rel/cos (the metric that actually predicts PPL), compared to
+  MXFP4 under the same weighting.
+- Only if weighted-validate closes the gap to near-MXFP4 do we proceed to full conversion + the
+  glm.c fmt=6 loader/kernel + the wall-clock N=1/N=16 + bounded-PPL gate.
+
+Probe tooling kept: `conv-glm52-iq2.py` (on box + local scratch
+`C:\Users\azavjalo\AppData\Local\Temp\opencode\conv-glm52-iq2.py`); report `/tmp/iq2-validate-report.json`.
+
+### Task 4 — STEP 2 RESULT: imatrix (calibration) does NOT rescue uniform ~2.25b either
+
+Built the imatrix pipeline end-to-end and measured it:
+- **glm.c instrumentation** (`IMATRIX=<file>` env): added globals + `imat_init`/`imat_accum`/`imat_dump`,
+  a per-expert accumulation hook in `moe()`'s CPU loop (right after the gate+up+down compute, covering
+  both the fmt=5 and fallback branches at the shared `xg`/`gg` buffers), and `atexit(imat_dump)`.
+  Patch script `c/patch_imatrix.py`; backup `/tmp/glm.c.bak.imatrix`. Dump format: header
+  `{int32 magic 0x54414D49 'IMAT', L, E, D, I}` + `f64[L*E*D]` gate/up-input Σx² + `f64[L*E*I]`
+  down-input Σx² (per input CHANNEL, per (layer,expert)). Built clean (only the pre-existing
+  snprintf warnings).
+- **Calibration run:** `IMATRIX=/srv/models/glm52-mxfp4/imatrix.bin SCORE=score_probes.txt ... ./glm 256`
+  — all 36 probes scored, dumped `imatrix.bin` = 1,308,622,868 B (matches 20 + 78·256·(6144+2048)·8).
+  Retained at `/srv/models/glm52-mxfp4/imatrix.bin`.
+- **Importance-weighted quantizer** (`quantize_iq2_imat` in conv-glm52-iq2.py): per-group E8M0 scale +
+  4-level signed codebook fit by **importance-weighted** 1-D k-means (error `Σ imp_col·(w−q)²`), 2-bit
+  codes. Validate now reports the **weighted** rel-err `Σ imp·|Δw| / Σ imp·|w|` — the PPL-predictive
+  metric — for IQ2 vs MXFP4.
+
+**Result (N=60 routed-expert tensors, layers 3/20/40/60/77):**
+
+| Metric | MXFP4 (~4.25b) | IMAT-IQ2 (~2.25b) | ratio |
+|---|---|---|---|
+| WEIGHTED mean rel-err | 0.1068 | 0.3667 | **3.43×** |
+| unweighted mean rel-err | 0.108 | 0.386 | 3.5× |
+| mean row-cosine | 0.9934 | 0.931 | — |
+
+**Imatrix weighting bought essentially nothing: weighted ≈ unweighted per-tensor** (e.g. L20 E192
+gate wrel 0.3725 vs urel 0.3726), and the ratio is flat across gate/up/down (all 3.43×). Root cause:
+GLM-5.2's per-input-channel activation importance is **too flat to relocate quantization error** —
+there are no low-importance channels to dump error into. This is exactly why Unsloth's UD-IQ2 works
+on *some* models (skewed importance + never-activated channels) but not here. The binding constraint
+is representational: **true 2-bit = 4 scalar levels cannot fit near-Gaussian expert weights near
+4-bit fidelity**, and calibration cannot manufacture skew that isn't in the activations.
+
+**VERDICT: uniform ~2.25b routed-expert quant is a NO-GO — twice-disconfirmed (weight-only RTN AND
+imatrix-weighted).** The 2-bit hypothesis as a *uniform routed-expert format* is closed.
+
+**What remains genuinely untested (did NOT probe):**
+1. **True vector/lattice codebook (llama.cpp IQ2_XXS/IQ2_S-style, ~2.06–2.31b):** 8 weights share a
+   256-entry signed 8-D grid — encodes *shape correlations* a 1-D 4-level scalar codebook cannot. This
+   is what actually ships at ~2.3b in llama.cpp. Substantial kernel effort (grid-lookup dequant), and
+   real risk it still trails 4-bit given the 3.4× scalar gap — but it is the only 2-bit variant with a
+   fundamentally different representational basis.
+2. **Mixed ~3-bit allocation:** keep down_proj + most-sensitive experts at 3–4b, drop only the
+   well-behaved gate/up of low-importance experts to ~2b → ~2.6–3.0b avg, softer **~1.2–1.3×** win,
+   far likelier to pass bounded-PPL. Aligns with Unsloth's *actual* UD-IQ2_M average (~2.6b) rather
+   than a true 2b.
+
+Artifacts kept: `conv-glm52-iq2.py` (+ imatrix loader/weighted quantizer), `c/patch_imatrix.py`,
+`imatrix.bin` (1.31 GB), `iqw-report.json`. glm.c IMATRIX instrumentation is LANDED-IN-TREE (useful
+for any future calibrated-quant work) — decide whether to keep or revert it with the path choice.
+
+### Task 4 — STEP 3 RESULT: 3-bit IS viable — and uniform 3b beats a mixed scheme
+
+Probed 3-bit variants (imatrix-weighted rel-err, the PPL-predictive metric; N=60 routed tensors,
+layers 3/20/40/60/77 × 4 experts):
+
+| Format | bits/wt | WEIGHTED rel-err | cos | ratio vs MXFP4 |
+|---|---|---|---|---|
+| MXFP4 (fmt=5)                          | ~4.25 | 0.107 | 0.993 | 1.00× |
+| **h3e — per-TENSOR 8-lvl k-means cb + E8M0 gs32** | **~3.06** | **0.196** | **0.981** | **1.83×** |
+| IMAT-IQ2 (2-bit)                       | ~2.25 | 0.367 | 0.931 | 3.43× |
+
+**3-bit clears the bar the way 2-bit couldn't, and it's UNIFORM across gate/up/down (all 1.83×, no
+outlier tensor)** — unlike 2-bit where down_proj blew up. cos 0.981 vs MXFP4's 0.993. 1.83× weighted
+rel-err at 0.72× the bits is a far better quality/bit slope than 2-bit's 3.43× at 0.53×.
+
+Two design lessons from the probe:
+- **A FIXED 3-bit grid fails** (`{-6,-3,-1.5,-.5,.5,1.5,3,6}/6` gave wrel 0.62 — worse than 2-bit).
+  The 8 levels MUST be **data-fit by k-means**, not hardcoded.
+- **Per-TENSOR codebook = per-ROW** (0.1955 vs ~0.192) at 1/30th the cost → the kernel needs only an
+  **8-entry per-tensor LUT** + E8M0 group scale. A cheap clone of the MXFP4 LUT kernel.
+
+**PIVOT — go UNIFORM 3b, not mixed.** Since 3b quality is uniform (no sensitive-tensor outliers), a
+mixed 3b/4b scheme only *dilutes* the speedup. Wall-clock projection (expert-matmul 15.22s→scales
+with feed bytes):
+
+| Scheme | avg bits | decode | tok/s | speedup |
+|---|---|---|---|---|
+| all MXFP4 (now)        | 4.25 | 20.8s | 12.3 | 1.00× |
+| **all 3b (fmt=6)**     | 3.06 | 16.6s | 15.4 | **1.26×** |
+| 75% 3b + 25% MXFP4     | 3.36 | 17.6s | 14.5 | 1.18× |
+| 50/50                  | 3.66 | 18.7s | 13.7 | 1.11× |
+
+So: convert ALL 256×75 routed experts to fmt=6 (3b). Keep the mixed option ONLY as a fallback — if
+uniform-3b fails bounded-PPL, selectively bump the worst experts back to MXFP4 (fmt=5), which glmrt
+supports for free at per-tensor granularity.
+
+**fmt=6 FORMAT (decided):** per-expert-proj emits THREE sidecars:
+`...weight` = 3-bit codes packed (8 codes / 3 bytes, or simpler 1 code/byte-with-waste? NO — pack
+tight: I codes × 3b = 3I/8 bytes/row), `..._scale` = E8M0 uint8 [O, I/32] (reuse fmt=5's sidecar
+name + loader), `..._cb` = f32[8] per-tensor codebook (tiny). Kernel `matmul_iq3`/`matmul_iq3_bf16`
+= clone of `matmul_mxfp4`/`_bf16` (glm.c:520/565) with the fixed E2M1 LUT replaced by the 8-entry
+per-tensor `_cb` loaded into the `_mm512_permutexvar` table; unpack 3-bit codes instead of 4-bit
+nibbles; same E8M0 group-scale fold. Dispatch `if(w->fmt==6)` at glm.c:1685. Loader hook at
+glm.c:2687-2689: `_scale` present AND `nb == O*ceil(3*I/8)` → fmt=6.
+
+**NEXT:** implement fmt=6 (converter emit + glm.c loader + kernel), convert routed experts, gate on
+wall-clock N=1 AND N=16 + bounded-PPL (extend score_compare.py to logprob-sum delta). This is the
+first lever in the whole investigation that both attacks the bandwidth wall AND has a viable
+quality basis.
+
+---
+
+## Task-4 RESULT (2026-07-20): IQ3 fmt=6 MEASURED — NO-GO for S=1 decode
+
+The projection above (1.26× from feed-byte scaling) was WRONG. It assumed decode scales
+with weight-feed bytes — but the clean fifo-fenced perf proof (this session) established
+decode is **memory-LATENCY / low-MLP bound, NOT DRAM-bandwidth-bound** (only 0.72% of loads
+reach DRAM; ~12× BW headroom). Shrinking feed bytes therefore cannot help, and ADDING
+decode-path compute hurts.
+
+**Wall-clock A/B (N=1, canonical tuned recipe: 128T, NUMA_PARTITION=1, numactl --interleave=all,
+REPLAY, 80 decode tokens):**
+
+| model | decode | tok/s | expert-matmul |
+|---|---|---|---|
+| glm52-mxfp4 (baseline) | 19.931s | **4.01** | 14.470s |
+| glm52-iq3 (fmt=6)      | 29.727s | **2.69** | 23.927s |
+| delta                  | +9.80s  | **1.49× SLOWER** | **+9.46s (+65%)** |
+
+Entire regression is in expert-matmul (+65%). attention (3.56→3.73s), lm_head (0.12s),
+other (1.78→1.95s) unchanged — as expected, only routed experts became fmt=6.
+
+**Quality gate (36 probes / 562 tok, TEMP=0, single-die 40T, ABSORB=1, SCORE):**
+- mxfp4 nat/tok 2.787485 → iq3 nat/tok 2.845367 = **+0.057882 nat/tok (~6% PPL, exp(0.0579)=1.060)**
+- **ARGMAX/GREEDY FLIPS: 0/36.** Quality is fine. Quality was never the problem.
+
+**Root cause:** `matmul_iq3` must, per weight, unpack a 3-bit code + do an 8-entry per-tensor
+LUT lookup + fold the E8M0 group scale — extra work injected onto the already-serialized
+dependent-load chain that IS the decode bottleneck. Cutting a resource with 12× surplus
+(DRAM bytes) at the cost of the resource we're bound on (near-cache load latency / ILP) is a
+net loss. **Generalizes: quantizing the weight feed cannot speed S=1 decode on this box.**
+
+**N=16 note:** current glm.c REPLAY is hardcoded S=1 (`step(m,full+i,1,i)`); `BATCH` env is
+dead (not read). True batched decode only via `run_serve_mux`/`openai_server.py`. N=16 would
+not rescue IQ3 anyway — at S≥8/16 the mxfp4 path engages AMX tiles, so a scalar 3-bit-unpack
+kernel is even more disadvantaged. Only reopens if a batched AMX fmt=6 kernel is written AND
+MTP raises S.
+
+**Disposition:** IQ3 → settled-negatives in AGENTS.md. fmt=6 kernel/loader/converter KEPT in
+tree as verified, env-gated, opt-in (may be reused if a batched AMX variant is ever built).
+Model `/srv/models/glm52-iq3` retained for reference. **Quant thrust (2-bit + 3-bit) fully
+closed.** Next lever: MTP / speculative decode (raise S).
